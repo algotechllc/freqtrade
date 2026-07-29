@@ -93,7 +93,7 @@ trading:
   sell_ladder_rebalance_threshold_pct: 5.0
 
 price_elevation:
-  enabled: true
+  enabled: false
   window_hours: 2160
   tiers:
     - max_percentile: 20
