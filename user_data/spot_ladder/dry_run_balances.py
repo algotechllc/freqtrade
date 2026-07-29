@@ -143,6 +143,16 @@ def compute_dry_run_balances_flat(
     double-counting seed lots + fills that OrderManager already saved).
     """
     refresh_dry_order_fills(exchange, pair)
+    # Persist fill-status changes (open → closed) so restarts keep the same book as LIVE.
+    try:
+        from spot_ladder.dry_run_order_store import save_dry_run_orders
+
+        state_dir = os.path.dirname(filled_orders_path) if filled_orders_path else ""
+        if state_dir:
+            save_dry_run_orders(exchange, pair, state_dir, base_currency)
+    except Exception as e:
+        logger.debug("dry-run order persist after balance refresh failed: %s", e)
+
     dry_for_pair = [
         o for o in exchange._dry_run_open_orders.values() if o.get("symbol") == pair
     ]

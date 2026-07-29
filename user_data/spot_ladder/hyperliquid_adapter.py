@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class HyperliquidExchangeAdapter:
     """Bridge OrderManager to Hyperliquid via Freqtrade's Exchange."""
 
-    def __init__(self, exchange: Exchange, pair: str):
+    def __init__(self, exchange: Exchange, pair: str, state_dir: str | None = None):
         self.exchange = exchange
         self.pair = pair
         parts = pair.split("/")
@@ -26,6 +26,19 @@ class HyperliquidExchangeAdapter:
         quote = parts[1] if len(parts) > 1 else "USDC"
         # XRP/USDC:USDC → USDC (settle suffix after colon)
         self.market = quote.split(":")[0].upper()
+        self._state_dir = state_dir
+        # Restore dry-run book from disk so restarts behave like LIVE open orders.
+        if state_dir and exchange._config.get("dry_run"):
+            from spot_ladder.dry_run_order_store import load_dry_run_orders
+
+            load_dry_run_orders(exchange, pair, state_dir, self.cointype)
+
+    def _persist_dry_orders(self) -> None:
+        if not self._state_dir or not self.exchange._config.get("dry_run"):
+            return
+        from spot_ladder.dry_run_order_store import save_dry_run_orders
+
+        save_dry_run_orders(self.exchange, self.pair, self._state_dir, self.cointype)
 
     def _amount_to_precision(self, amount: float) -> float:
         return float(self.exchange.amount_to_precision(self.pair, amount))
@@ -151,6 +164,10 @@ class HyperliquidExchangeAdapter:
     def _get_open_orders(self) -> list[dict[str, Any]]:
         """Open orders for this pair (dry-run store or exchange API)."""
         if self.exchange._config.get("dry_run"):
+            from spot_ladder.dry_run_balances import refresh_dry_order_fills
+
+            refresh_dry_order_fills(self.exchange, self.pair)
+            self._persist_dry_orders()
             return [
                 o
                 for o in self.exchange._dry_run_open_orders.values()
@@ -236,6 +253,7 @@ class HyperliquidExchangeAdapter:
                 leverage=1.0,
                 reduceOnly=False,
             )
+            self._persist_dry_orders()
             return {"status": "ok", "id": str(order.get("id", ""))}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -255,6 +273,7 @@ class HyperliquidExchangeAdapter:
                 leverage=1.0,
                 reduceOnly=True,
             )
+            self._persist_dry_orders()
             return {"status": "ok", "id": str(order.get("id", ""))}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -262,6 +281,7 @@ class HyperliquidExchangeAdapter:
     def cancel_order(self, order_id: str, order_type: str = "buy") -> dict[str, Any]:
         try:
             self.exchange.cancel_order(order_id, self.pair)
+            self._persist_dry_orders()
             return {"status": "ok"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -300,12 +320,15 @@ class HyperliquidExchangeAdapter:
             )
             new_id = str(order.get("id") or "")
             if not new_id:
+                self._persist_dry_orders()
                 return {
                     "status": "error",
                     "message": f"Cancel succeeded but replace returned no id (old={order_id})",
                 }
+            self._persist_dry_orders()
             return {"status": "ok", "id": new_id}
         except Exception as e:
+            self._persist_dry_orders()
             return {"status": "error", "message": str(e)}
 
     def buy_now(self, *args: Any, **kwargs: Any) -> dict[str, Any]:

@@ -88,11 +88,17 @@ class SpotLadderStrategy(IStrategy):
         notifier = create_ladder_notifier(self._ladder_config, self.config)
         symbols = self._ladder_config["trading"]["symbols"]
 
+        state_dir = self._ladder_config.get("paths", {}).get("state_dir") or str(
+            USER_DATA_DIR / "spot_ladder" / "state"
+        )
+
         self._managers = []
         for symbol in symbols:
             pair = self._resolve_ccxt_pair(symbol)
             self._pair_by_symbol[symbol] = pair
-            adapter = HyperliquidExchangeAdapter(self.dp._exchange, pair)
+            adapter = HyperliquidExchangeAdapter(
+                self.dp._exchange, pair, state_dir=state_dir
+            )
             manager = OrderManager(
                 symbol=symbol,
                 api=adapter,
@@ -134,8 +140,13 @@ class SpotLadderStrategy(IStrategy):
         if self.config.get("dry_run") and not wallet_address.strip() and not private_key.strip():
             return self._dry_run_balances_flat()
 
+        state_dir = (self._ladder_config or {}).get("paths", {}).get("state_dir") or str(
+            USER_DATA_DIR / "spot_ladder" / "state"
+        )
         adapter = HyperliquidExchangeAdapter(
-            self.dp._exchange, next(iter(self._pair_by_symbol.values()), "XRP/USDC:USDC")
+            self.dp._exchange,
+            next(iter(self._pair_by_symbol.values()), "XRP/USDC:USDC"),
+            state_dir=state_dir,
         )
         try:
             return HyperliquidExchangeAdapter.balances_to_flat(adapter.get_balances())

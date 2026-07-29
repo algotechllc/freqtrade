@@ -12,7 +12,7 @@ Deployable ladder config and code are tracked in git. Runtime files stay on the 
 ## Not tracked (created on the server)
 
 - `config-private.json` — Hyperliquid wallet / key
-- `spot_ladder/state/*.json` — live ledger (`filled_orders_*`, `price_high_*`, `working_orders_*`, …)
+- `spot_ladder/state/*.json` — live ledger (`filled_orders_*`, `price_high_*`, `working_orders_*`, `dry_run_orders_*`, …)
 - `tradesv3.sqlite`, `logs/*`, `data/*`
 
 ## Server deploy
@@ -32,6 +32,8 @@ docker compose logs -f
 ```
 
 Updates: `git pull` then `docker compose restart freqtrade`. Do not overwrite `spot_ladder/state/*.json` or `config-private.json` when pulling.
+
+Dry-run open/closed ladder orders are persisted to `spot_ladder/state/dry_run_orders_XRP.json` so a restart adopts the book like LIVE `fetch_open_orders` (instead of wiping memory and recreating the full ladder).
 
 ## Slack notifications (ladder bot)
 
