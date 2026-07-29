@@ -232,12 +232,14 @@ def dry_run_completed_order_rows(
         if order.get("symbol") != pair or (order.get("status") or "") != "closed":
             continue
         side = _order_side(order)
-        ts = order.get("timestamp")
-        solddate = ""
-        if ts:
-            from datetime import datetime, timezone
+        from datetime import datetime, timezone
 
+        ts = order.get("timestamp")
+        if ts:
             solddate = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).isoformat()
+        else:
+            # OrderManager sync uses solddate for Slack freshness; dry-run closes must have a stamp.
+            solddate = datetime.now(timezone.utc).isoformat()
         row = {
             "id": str(order.get("id", "")),
             "amount": float(order.get("filled") or order.get("amount") or 0),

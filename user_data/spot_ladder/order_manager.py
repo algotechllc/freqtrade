@@ -531,8 +531,86 @@ class OrderManager:
                 return True
         
         return False
-    
-    def _save_filled_order(self, order: Order, fill_timestamp: str = None):
+
+    def _find_stored_buy_row_for_order(self, order: Order) -> Optional[dict]:
+        """Return the buy_orders JSON row matching this fill, if any."""
+        order_id = str(order.order_id) if order.order_id else ""
+        stored_orders = self._load_filled_orders()
+        for row in stored_orders:
+            if order_id and (
+                str(row.get("order_id", "")) == order_id
+                or str(row.get("api_order_id", "")) == order_id
+            ):
+                return row
+        order_amount = float(order.amount)
+        order_rate = float(order.rate)
+        for row in stored_orders:
+            stored_amount = float(row.get("amount", 0))
+            stored_rate = float(row.get("rate", 0))
+            amount_match = stored_amount > 0 and abs(order_amount - stored_amount) / stored_amount < 0.01
+            rate_match = stored_rate > 0 and abs(order_rate - stored_rate) / stored_rate < 0.001
+            if amount_match and rate_match:
+                return row
+        return None
+
+    def _buy_fill_slack_was_sent(self, order: Order) -> bool:
+        row = self._find_stored_buy_row_for_order(order)
+        return bool(row and row.get("slack_notified"))
+
+    def _mark_buy_fill_slack_notified(self, order: Order) -> None:
+        """Persist slack_notified on the matching buy_orders row (no-op if not in ledger yet)."""
+        file_path = self._get_filled_orders_file_path()
+        if not os.path.exists(file_path):
+            return
+        order_id = str(order.order_id) if order.order_id else ""
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                data = json.load(f)
+            buys = data.get("buy_orders") or []
+            updated = False
+            for row in buys:
+                if order_id and (
+                    str(row.get("order_id", "")) == order_id
+                    or str(row.get("api_order_id", "")) == order_id
+                ):
+                    row["slack_notified"] = True
+                    updated = True
+                    break
+            if not updated:
+                match = self._find_stored_buy_row_for_order(order)
+                if match:
+                    match_id = match.get("order_id")
+                    for r in buys:
+                        if r.get("order_id") == match_id:
+                            r["slack_notified"] = True
+                            updated = True
+                            break
+            if updated:
+                data["buy_orders"] = buys
+                data["last_updated"] = datetime.utcnow().isoformat()
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+        except Exception as e:
+            logging.debug(f"{self.symbol}: Could not mark slack_notified: {e}")
+
+    def _notify_buy_fill_if_needed(
+        self, order: Order, amount: float, rate: float
+    ) -> None:
+        if self._buy_fill_slack_was_sent(order):
+            logging.debug(
+                f"{self.symbol}: Buy fill Slack already sent for order {order.order_id}"
+            )
+            return
+        self.notifier.notify_order_filled(
+            symbol=self.symbol,
+            side="buy",
+            amount=amount,
+            rate=rate,
+            avg_entry=None,
+        )
+        self._mark_buy_fill_slack_notified(order)
+
+    def _save_filled_order(self, order: Order, fill_timestamp: str = None) -> bool:
         """Save a filled buy order to local JSON file
         
         IMPORTANT: This method should ONLY be called for orders that have been
@@ -543,7 +621,7 @@ class OrderManager:
         bought, not orders placed until we buy those tokens.
         """
         if order.side != 'buy':
-            return  # Only save buy orders for average entry calculation
+            return False  # Only save buy orders for average entry calculation
         
         # Additional safety check: verify the order is not in open_orders
         # If it's still open, it hasn't been filled yet and shouldn't be saved
@@ -551,7 +629,7 @@ class OrderManager:
             if any(o.order_id == order.order_id for o in self.open_orders):
                 logging.warning(f"{self.symbol}: ⚠️ Attempted to save order {order.order_id} to JSON, but it's still in open_orders. "
                               f"This order has NOT been filled yet - skipping save to prevent inaccurate prices.")
-                return
+                return False
         
         file_path = self._get_filled_orders_file_path()
         
@@ -602,7 +680,7 @@ class OrderManager:
                     f"{self.symbol}: ❌ Order {order_id} ({order.amount:.8f} @ {order.rate:.4f}) NOT found in completed orders API. "
                     f"This order may not have actually filled. Skipping save to prevent inaccurate tracking."
                 )
-                return
+                return False
             
             logging.info(f"{self.symbol}: ✓ Order {order_id} verified in completed orders API, proceeding with save")
         
@@ -616,7 +694,7 @@ class OrderManager:
             if existing_order_id == order_id:
                 if existing_balance is not None and abs(float(existing_balance) - float(current_balance)) < 0.00000001:
                     logging.debug(f"{self.symbol}: Order {order_id} already stored with same balance ({current_balance:.8f}), skipping duplicate")
-                    return
+                    return False
                 # Same order_id but different balance - likely a partial fill, allow it
                 continue
             
@@ -652,7 +730,7 @@ class OrderManager:
                     logging.warning(f"{self.symbol}: Duplicate order detected - same coin_balance_at_save ({current_balance:.8f}) "
                                   f"and similar amount/rate/timestamp. Existing: {existing_order_id}, "
                                   f"New: {order_id}. Skipping duplicate.")
-                    return
+                    return False
         
         # Create order record
         # NOTE: We use the order.rate (the price at which the order was placed)
@@ -708,8 +786,10 @@ class OrderManager:
                     )
                 except Exception as e:
                     logging.debug(f"{self.symbol}: Performance tracker record_trade (buy) failed: {e}")
+            return True
         except Exception as e:
             logging.error(f"{self.symbol}: Failed to save filled order to {file_path}: {e}")
+        return False
     
     def _save_filled_sell_order(self, order: Order, fill_timestamp: str = None):
         """Save a filled sell order to local JSON file and consume buy orders via LIFO
@@ -1687,17 +1767,19 @@ class OrderManager:
                     # Send individual order_filled notification for synced orders
                     # This ensures users get notified even if orders filled while bot was offline
                     if self._should_telegram_notify_synced_fill(solddate, is_startup_sync, baseline_last_updated):
-                        self.notifier.notify_order_filled(
+                        stub = Order(
+                            order_id=api_order_id or order_id,
                             symbol=self.symbol,
-                            side='buy',
                             amount=amount,
                             rate=rate,
-                            avg_entry=None  # Will be calculated later when average entry is updated
+                            side="buy",
+                            market=self.market,
                         )
+                        self._notify_buy_fill_if_needed(stub, amount, rate)
                     else:
                         logging.info(
                             f"{self.symbol}: Skipping Telegram for synced buy fill "
-                            f"({amount:.8f} @ {rate:.4f}, date: {solddate[:19]}) — fill too old for sync notify"
+                            f"({amount:.8f} @ {rate:.4f}, date: {(solddate or '')[:19]}) — fill too old for sync notify"
                         )
                 
                     # Only stop early if syncing by balance (not by time)
@@ -6479,45 +6561,22 @@ class OrderManager:
                             price_diff = ((self.current_price - missing_order.rate) / missing_order.rate * 100) if self.current_price > 0 and missing_order.rate > 0 else 0
                             price_note = f" (current price: {self.current_price:.4f}, {price_diff:+.1f}% from fill price)" if self.current_price > 0 else ""
                             
-                            # For buy orders, check if already in JSON before notifying
-                            # This prevents duplicate notifications when sync method also finds the order
                             if missing_order.side == 'buy':
-                                completed = self._find_completed_order(missing_order) if is_verified_fill else None
+                                completed = self._find_completed_order(missing_order)
                                 fill_amount = float(completed.get('amount', missing_order.amount)) if completed else missing_order.amount
                                 fill_rate = float(completed.get('rate', missing_order.rate)) if completed else missing_order.rate
                                 fill_timestamp = completed.get('solddate') if completed else None
-
-                                # Check if order is already in JSON (was already synced and notified)
-                                if not self._is_order_already_in_json(missing_order):
-                                    self.notifier.notify_order_filled(
-                                        symbol=self.symbol,
-                                        side=missing_order.side,
-                                        amount=fill_amount,
-                                        rate=fill_rate,
-                                        avg_entry=None
-                                    )
-                                else:
-                                    logging.debug(f"{self.symbol}: Order {order_id} already in JSON, skipping notification (already notified by sync)")
-                            
-                            logging.info(f"{self.symbol}: Order {order_id} ({missing_order.side}) FILLED - "
-                                       f"{missing_order.amount:.8f} @ {missing_order.rate:.4f}{price_note}{verification_note}")
-                            
-                            # Track filled buy orders for average entry calculation
-                            if missing_order.side == 'buy':
-                                # Save to JSON - we've verified the fill either by balance change or via API
-                                # The is_verified_fill flag is only True if we confirmed via one of these methods
+                                if completed:
+                                    missing_order.amount = fill_amount
+                                    missing_order.rate = fill_rate
+                                save_timestamp = fill_timestamp or datetime.utcnow().isoformat()
+                                saved = self._save_filled_order(missing_order, save_timestamp)
+                                self._notify_buy_fill_if_needed(
+                                    missing_order, fill_amount, fill_rate
+                                )
                                 coin_balance_change = self.coin_balance - self.previous_coin_balance
                                 expected_increase = missing_order.amount
-                                
-                                # IMPROVED: If is_verified_fill is True, it was confirmed via API or balance
-                                # Save it regardless of which method confirmed it
-                                if is_verified_fill:
-                                    # Use API fill details when available (actual amount, rate, solddate)
-                                    if completed:
-                                        missing_order.amount = fill_amount
-                                        missing_order.rate = fill_rate
-                                    save_timestamp = fill_timestamp or datetime.utcnow().isoformat()
-                                    self._save_filled_order(missing_order, save_timestamp)
+                                if saved:
                                     if "via API" in verification_note:
                                         logging.info(
                                             f"{self.symbol}: Verified token receipt via API. "
@@ -6531,23 +6590,18 @@ class OrderManager:
                                             f"(+{coin_balance_change:.8f}, expected ~{expected_increase:.8f}). "
                                             f"Saved order {order_id} to JSON."
                                         )
-                                else:
-                                    # Not verified - don't save
-                                    logging.warning(
-                                        f"{self.symbol}: Order {order_id} (buy) not verified - not saving to JSON. "
-                                        f"Balance change: {coin_balance_change:.8f}, Expected: {expected_increase:.8f}. "
-                                        f"Verification note: {verification_note}"
-                                    )
-                                
-                                # Update tracked values for average entry calculation
                                 self.total_coins += missing_order.amount
                                 self.total_invested += missing_order.amount * missing_order.rate
-                                logging.info(f"{self.symbol}: Tracked buy fill - {missing_order.amount:.8f} @ {missing_order.rate:.4f}, "
-                                            f"total: {self.total_coins:.8f} coins, ${self.total_invested:.2f} invested")
-                                
-                            
+                                logging.info(
+                                    f"{self.symbol}: Tracked buy fill - {missing_order.amount:.8f} @ {missing_order.rate:.4f}, "
+                                    f"total: {self.total_coins:.8f} coins, ${self.total_invested:.2f} invested"
+                                )
+
+                            logging.info(f"{self.symbol}: Order {order_id} ({missing_order.side}) FILLED - "
+                                       f"{missing_order.amount:.8f} @ {missing_order.rate:.4f}{price_note}{verification_note}")
+
                             # Track filled sell orders (reduce tracked position via LIFO)
-                            elif missing_order.side == 'sell':
+                            if missing_order.side == 'sell':
                                 completed = self._find_completed_order(missing_order)
                                 fill_amount = float(completed.get('amount', missing_order.amount)) if completed else missing_order.amount
                                 fill_rate = float(completed.get('rate', missing_order.rate)) if completed else missing_order.rate
