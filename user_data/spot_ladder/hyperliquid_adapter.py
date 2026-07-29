@@ -33,6 +33,37 @@ class HyperliquidExchangeAdapter:
     def _price_to_precision(self, price: float) -> float:
         return float(self.exchange.price_to_precision(self.pair, price))
 
+    def _is_futures(self) -> bool:
+        mode = self.exchange._config.get("trading_mode", "spot")
+        value = getattr(mode, "value", mode)
+        return str(value).lower() == "futures"
+
+    def _long_position_amount(self) -> float:
+        """Base-currency size of an open long (futures). Spot leaves this unused."""
+        if not self._is_futures():
+            return 0.0
+        if not self.exchange.exchange_has("fetchPositions"):
+            return 0.0
+        try:
+            positions = self.exchange.fetch_positions(self.pair)
+        except Exception as e:
+            logger.warning("fetch_positions failed for %s: %s", self.pair, e)
+            raise
+        for pos in positions or []:
+            if pos.get("symbol") != self.pair:
+                continue
+            side = (pos.get("side") or "").lower()
+            contracts = float(pos.get("contracts") or 0)
+            if contracts <= 0:
+                continue
+            size = float(self.exchange._contracts_to_amount(self.pair, contracts))
+            # Ladder models long inventory only; shorts are not sellable "holdings".
+            if side == "long":
+                return abs(size)
+            if side == "short":
+                return 0.0
+        return 0.0
+
     def get_latest_price(self, cointype: str, market: str = "USDC") -> dict[str, Any]:
         try:
             ticker = self.exchange.fetch_ticker(self.pair)
@@ -50,7 +81,12 @@ class HyperliquidExchangeAdapter:
             return {"status": "error", "message": str(e)}
 
     def get_balances(self) -> dict[str, Any]:
-        """Balance payload for OrderManager; strategy wrapper converts to a flat dict."""
+        """
+        Balance payload for OrderManager.
+
+        Quote (USDC): prefer free collateral.
+        Base (XRP): futures long position size when trading_mode=futures; else wallet total.
+        """
         balances = self.exchange.get_balances()
         items: list[dict[str, Any]] = []
         for currency, row in balances.items():
@@ -58,9 +94,22 @@ class HyperliquidExchangeAdapter:
                 continue
             if not isinstance(row, dict):
                 continue
-            total = float(row.get("total") or row.get("free") or 0)
-            items.append({currency.upper(): {"balance": total}})
-        return {"status": "ok", "balances": items}
+            # Prefer free for new buy capacity; fall back to total.
+            free = row.get("free")
+            total = row.get("total")
+            if free is not None:
+                amount = float(free)
+            else:
+                amount = float(total or 0)
+            items.append({currency.upper(): {"balance": amount}})
+
+        flat = {k: v for item in items for k, v in item.items()}
+        if self._is_futures():
+            flat[self.cointype] = {"balance": self._long_position_amount()}
+        elif self.cointype not in flat:
+            flat[self.cointype] = {"balance": 0.0}
+
+        return {"status": "ok", "balances": [{k: v} for k, v in flat.items()]}
 
     @staticmethod
     def balances_to_flat(balances_response: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -84,7 +133,12 @@ class HyperliquidExchangeAdapter:
             return 0
 
     def _ccxt_order_to_ladder_row(self, order: dict[str, Any], side: str) -> dict[str, Any]:
-        amount = float(order.get("amount") or order.get("remaining") or 0)
+        # Prefer remaining so partial fills don't overstate commitment.
+        remaining = order.get("remaining")
+        if remaining is not None:
+            amount = float(remaining)
+        else:
+            amount = float(order.get("amount") or 0)
         rate = float(order.get("price") or 0)
         return {
             "id": str(order.get("id", "")),
@@ -121,7 +175,8 @@ class HyperliquidExchangeAdapter:
             return {"status": "ok", "buyorders": buyorders, "sellorders": sellorders}
         except Exception as e:
             logger.warning("get_orders failed: %s", e)
-            return {"status": "ok", "buyorders": [], "sellorders": []}
+            # Never pretend the book is empty — callers must skip ladder rebuilds.
+            return {"status": "error", "message": str(e), "buyorders": [], "sellorders": []}
 
     def get_completed_orders(self, cointype: str, market: str = "USDC", since_ms: Optional[int] = None) -> dict[str, Any]:
         """Recent fills for sync / verification (OrderManager response shape)."""
@@ -179,6 +234,7 @@ class HyperliquidExchangeAdapter:
                 amount=amount,
                 rate=rate,
                 leverage=1.0,
+                reduceOnly=False,
             )
             return {"status": "ok", "id": str(order.get("id", ""))}
         except Exception as e:
@@ -197,6 +253,7 @@ class HyperliquidExchangeAdapter:
                 amount=amount,
                 rate=rate,
                 leverage=1.0,
+                reduceOnly=True,
             )
             return {"status": "ok", "id": str(order.get("id", ""))}
         except Exception as e:
@@ -217,13 +274,17 @@ class HyperliquidExchangeAdapter:
         new_rate: float,
         order_type: str = "buy",
     ) -> dict[str, Any]:
-        """Hyperliquid: cancel and replace (edit_order API compatibility)."""
+        """Hyperliquid: cancel and replace. Returns new order id (callers must track it)."""
         try:
             open_orders = self._get_open_orders()
             target = next((o for o in open_orders if str(o.get("id")) == str(order_id)), None)
             if not target:
                 return {"status": "error", "message": "Order not found for edit"}
-            amount = float(target.get("amount") or target.get("remaining") or 0)
+            remaining = target.get("remaining")
+            if remaining is not None:
+                amount = float(remaining)
+            else:
+                amount = float(target.get("amount") or 0)
             side = (target.get("side") or order_type).lower()
             self.exchange.cancel_order(order_id, self.pair)
             new_rate = self._price_to_precision(new_rate)
@@ -235,8 +296,15 @@ class HyperliquidExchangeAdapter:
                 amount=amount,
                 rate=new_rate,
                 leverage=1.0,
+                reduceOnly=(side == "sell"),
             )
-            return {"status": "ok", "id": str(order.get("id", order_id))}
+            new_id = str(order.get("id") or "")
+            if not new_id:
+                return {
+                    "status": "error",
+                    "message": f"Cancel succeeded but replace returned no id (old={order_id})",
+                }
+            return {"status": "ok", "id": new_id}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 

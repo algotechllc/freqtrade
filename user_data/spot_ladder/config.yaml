@@ -117,6 +117,7 @@ safety:
   max_sell_orders: 15
   max_core_sell_orders: 15
   max_working_sell_orders: 6
+  # Unused by design — price_elevation tiers throttle buy allocation when price is high.
   max_position_size: 0
   trading_enabled: true
 

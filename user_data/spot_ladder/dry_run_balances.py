@@ -76,16 +76,33 @@ def _ledger_from_dry_orders(orders: list[dict[str, Any]], start_wallet: float) -
     return _apply_closed_dry_orders(orders, float(start_wallet), 0.0)
 
 
-def _ledger_from_filled_orders_json(path: str, start_wallet: float) -> tuple[float, float]:
-    """Reconstruct balances from ladder filled_orders JSON (manual seed / after restart)."""
+def _load_filled_orders_json(path: str) -> dict[str, Any] | None:
     if not os.path.isfile(path):
-        return float(start_wallet), 0.0
-
+        return None
     try:
         with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+            return json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("Could not read filled orders JSON %s: %s", path, e)
+        return None
+
+
+def _json_recorded_order_ids(data: dict[str, Any]) -> set[str]:
+    """IDs already in the ladder ledger — do not re-apply matching dry-run closes."""
+    ids: set[str] = set()
+    for key in ("buy_orders", "sell_orders"):
+        for row in data.get(key) or []:
+            for field in ("order_id", "api_order_id", "id"):
+                oid = row.get(field)
+                if oid:
+                    ids.add(str(oid))
+    return ids
+
+
+def _ledger_from_filled_orders_json(path: str, start_wallet: float) -> tuple[float, float]:
+    """Reconstruct balances from ladder filled_orders JSON (manual seed / after restart)."""
+    data = _load_filled_orders_json(path)
+    if data is None:
         return float(start_wallet), 0.0
 
     buys = data.get("buy_orders") or []
@@ -120,26 +137,34 @@ def compute_dry_run_balances_flat(
     stake_currency / base_currency keys are upper-case (e.g. USDC, XRP).
     Quote balance is the full dry_run_wallet after simulated fills (OrderManager
     applies balance_percentage_per_symbol separately).
+
+    When filled_orders JSON exists, start from that ledger. Closed dry-run orders
+    are applied only if their IDs are not already recorded in JSON (avoids
+    double-counting seed lots + fills that OrderManager already saved).
     """
     refresh_dry_order_fills(exchange, pair)
     dry_for_pair = [
         o for o in exchange._dry_run_open_orders.values() if o.get("symbol") == pair
     ]
 
-    has_json = os.path.isfile(filled_orders_path)
-    if has_json:
+    json_data = _load_filled_orders_json(filled_orders_path)
+    if json_data is not None:
         usdc, base = _ledger_from_filled_orders_json(filled_orders_path, start_wallet)
         source = "filled_orders JSON"
+        known_ids = _json_recorded_order_ids(json_data)
     else:
         usdc, base = float(start_wallet), 0.0
         source = "dry_run_wallet"
+        known_ids = set()
 
     if dry_for_pair:
         closed = [o for o in dry_for_pair if (o.get("status") or "") == "closed"]
         if closed:
-            usdc, base = _apply_closed_dry_orders(dry_for_pair, usdc, base)
-            source = f"{source} + closed dry-run orders"
-        # Open-only dry orders do not change holdings; JSON seed (or start_wallet) stays as-is.
+            unseen = [o for o in closed if str(o.get("id", "")) not in known_ids]
+            if unseen:
+                usdc, base = _apply_closed_dry_orders(unseen, usdc, base)
+                source = f"{source} + {len(unseen)} unseen closed dry-run order(s)"
+        # Open-only dry orders do not change holdings.
 
     stake = stake_currency.upper()
     coin = base_currency.upper()

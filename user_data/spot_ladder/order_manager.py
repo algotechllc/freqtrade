@@ -337,6 +337,55 @@ class OrderManager:
             logging.debug(f"{self.symbol}: Saved {len(self._working_order_ids)} Working order IDs to {self._working_orders_file}")
         except Exception as e:
             logging.warning(f"{self.symbol}: Failed to save Working order IDs to {file_path}: {e}")
+
+    def _replace_tracked_order_id(self, old_id: str, new_id: str, new_rate: float = None) -> None:
+        """After cancel+replace edit, keep fill/Working tracking on the new exchange id."""
+        if not old_id:
+            return
+        old_id = str(old_id)
+        new_id = str(new_id) if new_id else old_id
+        if old_id == new_id:
+            if new_rate is not None:
+                for o in self.open_orders:
+                    if o.order_id == old_id:
+                        o.rate = new_rate
+            return
+        if hasattr(self, 'previous_order_ids') and self.previous_order_ids is not None:
+            if old_id in self.previous_order_ids:
+                self.previous_order_ids.discard(old_id)
+                self.previous_order_ids.add(new_id)
+        if old_id in self._working_order_ids:
+            self._working_order_ids.discard(old_id)
+            self._working_order_ids.add(new_id)
+            self._save_working_order_ids()
+        for o in self.open_orders:
+            if o.order_id == old_id:
+                o.order_id = new_id
+                if new_rate is not None:
+                    o.rate = new_rate
+
+    def _nearest_ladder_level_pct(
+        self, order_rate: float, levels: list, base_price: float, *, is_buy: bool
+    ) -> Optional[float]:
+        """Map an open order to the closest configured ladder level by target price."""
+        if order_rate <= 0 or base_price <= 0 or not levels:
+            return None
+        best_level = None
+        best_diff = float("inf")
+        for level_pct in levels:
+            if is_buy:
+                target = base_price * (1 - float(level_pct) / 100)
+            else:
+                target = base_price * (1 + float(level_pct) / 100)
+            if target <= 0:
+                continue
+            diff = abs(target - order_rate) / order_rate
+            if diff < best_diff:
+                best_diff = diff
+                best_level = float(level_pct)
+        if best_level is None or best_diff > 0.15:
+            return None
+        return best_level
     
     def _get_filled_working_orders_file_path(self) -> str:
         """Get path to filled working orders history JSON file"""
@@ -1280,8 +1329,9 @@ class OrderManager:
             else:
                 completed_orders = result.get('sellorders', [])
             
+            # Prefer exact ID match (Hyperliquid numeric IDs, dry-run UUIDs, etc.)
             order_id = str(order.order_id) if hasattr(order, 'order_id') else ''
-            if order_id and len(order_id) >= 20 and all(c in '0123456789abcdef' for c in order_id.lower()):
+            if order_id:
                 for completed in completed_orders:
                     if str(completed.get('id', '')) == order_id:
                         return completed
@@ -2499,6 +2549,13 @@ class OrderManager:
     
     def update_open_orders(self, orders_data: Dict):
         """Update list of open orders from API response"""
+        if not orders_data or orders_data.get('status') == 'error':
+            logging.error(
+                f"{self.symbol}: Refusing to update open_orders from failed fetch "
+                f"({(orders_data or {}).get('message', 'no data')})"
+            )
+            return False
+
         self.open_orders = []
         
         # Parse orders from API response
@@ -4969,23 +5026,25 @@ class OrderManager:
                             if existing_sell_orders:
                                 time.sleep(1.0)
                             
-                        # Place orders at ALL placeable levels with proper distribution
-                        total_for_all_orders = core_coins * 0.98
-                        all_placeable_levels = []
-                        for level_idx, level_pct in enumerate(self.sell_levels[:needed_orders]):
-                            sell_price = avg_entry * (1 + level_pct / 100)
-                            if sell_price > self.current_price:
-                                all_placeable_levels.append((level_pct, sell_price))
+                            # Place ONLY after cancel — never on top of existing Core sells.
+                            total_for_all_orders = core_coins * 0.98
+                            all_placeable_levels = []
+                            for level_pct in self.sell_levels[:needed_orders]:
+                                sell_price = avg_entry * (1 + level_pct / 100)
+                                if sell_price > self.current_price:
+                                    all_placeable_levels.append((level_pct, sell_price))
                             
-                            # Use actual placeable count for proper weight normalization
                             num_placeable = len(all_placeable_levels)
-                            placed_amount = 0
+                            # Prefer sell_order_distribution; fall back to legacy order_size_distribution.
+                            use_weighted = self.sell_order_distribution == "weighted"
+                            placed_amount = 0.0
                             for order_idx, (level_pct, sell_price) in enumerate(all_placeable_levels):
-                                if self.order_size_distribution == "weighted":
-                                    # Use order_idx (0-based within placeable levels) for proper weight distribution
-                                    order_size = self.calculate_order_size(order_idx, num_placeable, total_for_all_orders, is_sell_order=True)
+                                if use_weighted:
+                                    order_size = self.calculate_order_size(
+                                        order_idx, num_placeable, total_for_all_orders, is_sell_order=True
+                                    )
                                 else:
-                                    order_size = total_for_all_orders / num_placeable
+                                    order_size = total_for_all_orders / num_placeable if num_placeable else 0
                                 
                                 remaining = total_for_all_orders - placed_amount
                                 order_size = min(order_size, remaining)
@@ -5009,7 +5068,6 @@ class OrderManager:
                                         logging.info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
                                                    f"({level_pct}% above entry), size: {rounded_amount:.8f}")
                                         placed_amount += rounded_amount
-                                        # Track order ID for fill detection
                                         if not hasattr(self, 'previous_order_ids'):
                                             self.previous_order_ids = set()
                                         self.previous_order_ids.add(order_id)
@@ -5757,11 +5815,16 @@ class OrderManager:
         # Try to edit orders first, fall back to cancel/recreate if editing fails
         orders_to_cancel = []
         
-        for i, order in enumerate(existing_orders):
-            if i >= len(self.buy_levels):
-                break
-            
-            buy_level_pct = self.buy_levels[i]
+        for order in existing_orders:
+            buy_level_pct = self._nearest_ladder_level_pct(
+                order.rate, self.buy_levels, self.current_price, is_buy=True
+            )
+            if buy_level_pct is None:
+                logging.debug(
+                    f"{self.symbol}: Skipping buy order {order.order_id} @ {order.rate:.4f} — "
+                    f"no matching ladder level"
+                )
+                continue
             
             # Deep levels (15%+) only reposition on DOWN moves
             # This allows them to stay at lower prices and fill on retracements
@@ -5791,7 +5854,11 @@ class OrderManager:
                     order_type="buy"
                 )
                 if response.get('status') == 'ok':
-                    logging.info(f"{self.symbol}: Updated buy order {order.order_id} to {new_price:.2f}")
+                    new_id = str(response.get('id') or order.order_id)
+                    self._replace_tracked_order_id(order.order_id, new_id, new_rate=new_rate)
+                    order.order_id = new_id
+                    order.rate = new_rate
+                    logging.info(f"{self.symbol}: Updated buy order {new_id} to {new_price:.2f}")
                     # Don't notify on order updates - too frequent, only log
                 else:
                     # Editing failed, mark for cancellation
@@ -6052,11 +6119,16 @@ class OrderManager:
         logging.info(f"{self.symbol}: Evaluating {len(existing_orders)} sell orders for updates "
                     f"(avg_entry: {avg_entry:.4f})")
         
-        for i, order in enumerate(existing_orders):
-            if i >= len(self.sell_levels):
-                break
-            
-            sell_level_pct = self.sell_levels[i]
+        for order in existing_orders:
+            sell_level_pct = self._nearest_ladder_level_pct(
+                order.rate, self.sell_levels, avg_entry, is_buy=False
+            )
+            if sell_level_pct is None:
+                logging.debug(
+                    f"{self.symbol}: Skipping sell order {order.order_id} @ {order.rate:.4f} — "
+                    f"no matching ladder level vs avg_entry {avg_entry:.4f}"
+                )
+                continue
             new_price = avg_entry * (1 + sell_level_pct / 100)
             
             # Calculate price change percentage
@@ -6116,16 +6188,21 @@ class OrderManager:
                     order_type="sell"
                 )
                 if response.get('status') == 'ok':
+                    new_id = str(response.get('id') or order.order_id)
+                    old_rate = order.rate
+                    self._replace_tracked_order_id(order.order_id, new_id, new_rate=new_price)
+                    order.order_id = new_id
+                    order.rate = new_price
                     orders_updated += 1
                     updated_details.append({
                         'level': sell_level_pct,
-                        'order_id': order.order_id,
-                        'old_price': order.rate,
+                        'order_id': new_id,
+                        'old_price': old_rate,
                         'new_price': new_price,
                         'diff_pct': price_diff_pct
                     })
-                    logging.info(f"{self.symbol}: Successfully updated sell order {order.order_id} at {sell_level_pct}% "
-                               f"(${order.rate:.4f} -> ${new_price:.4f}, change: {price_diff_pct:+.2f}%)")
+                    logging.info(f"{self.symbol}: Successfully updated sell order {new_id} at {sell_level_pct}% "
+                               f"(${old_rate:.4f} -> ${new_price:.4f}, change: {price_diff_pct:+.2f}%)")
                     # Don't notify on order updates - too frequent, only log
                 else:
                     # Editing failed, mark for cancellation
@@ -6301,12 +6378,20 @@ class OrderManager:
                 for order in self.open_orders:
                     previous_orders_dict[order.order_id] = order
             
-            # Initialize to empty list first to avoid reference errors
-            self.open_orders = []
+            orders_fetch_ok = False
             try:
                 orders_data = self.api.get_orders(self.cointype, self.market)
-                if orders_data:
+                if not orders_data or orders_data.get('status') != 'ok':
+                    err = (orders_data or {}).get('message', 'unknown error')
+                    logging.error(
+                        f"{self.symbol}: Open orders fetch failed ({err}) — "
+                        f"skipping ladder placement this cycle (will not treat book as empty)."
+                    )
+                else:
+                    # Only clear/replace open_orders after a successful fetch.
+                    self.open_orders = []
                     self.update_open_orders(orders_data)
+                    orders_fetch_ok = True
                     buy_count = len([o for o in self.open_orders if o.side == 'buy'])
                     sell_count = len([o for o in self.open_orders if o.side == 'sell'])
                     logging.debug(f"{self.symbol}: Fetched orders - {buy_count} buy, {sell_count} sell")
@@ -6463,11 +6548,22 @@ class OrderManager:
                             
                             # Track filled sell orders (reduce tracked position via LIFO)
                             elif missing_order.side == 'sell':
+                                completed = self._find_completed_order(missing_order)
+                                fill_amount = float(completed.get('amount', missing_order.amount)) if completed else missing_order.amount
+                                fill_rate = float(completed.get('rate', missing_order.rate)) if completed else missing_order.rate
+                                fill_timestamp = (
+                                    completed.get('solddate')
+                                    if completed and completed.get('solddate')
+                                    else datetime.now(timezone.utc).isoformat()
+                                )
+                                if completed:
+                                    missing_order.amount = fill_amount
+                                    missing_order.rate = fill_rate
+
                                 # Check if order is already in JSON before processing
                                 # This prevents duplicate notifications when sync method also finds the order
                                 # Don't pass fill_timestamp — same reasoning as the buy path above.
                                 order_already_in_json = self._is_order_already_in_json(missing_order)
-                                fill_timestamp = datetime.utcnow().isoformat()
                                 
                                 # Determine if this is a Working sell BEFORE save (save discards from _working_order_ids)
                                 is_working_sell = order_id in getattr(self, '_working_order_ids', set())
@@ -6522,14 +6618,17 @@ class OrderManager:
                     
                     # Update previous order IDs for next iteration
                     self.previous_order_ids = current_order_ids
-                else:
-                    # No orders data, clear previous tracking
-                    if hasattr(self, 'previous_order_ids'):
-                        self.previous_order_ids = set()
             except Exception as e:
-                logging.warning(f"{self.symbol}: Could not fetch open orders: {e}. Continuing without order data.")
-                # Continue with empty orders list (already initialized above)
+                orders_fetch_ok = False
+                logging.error(
+                    f"{self.symbol}: Could not fetch open orders: {e}. "
+                    f"Skipping ladder placement this cycle."
+                )
             
+            if not orders_fetch_ok:
+                logging.info(f"{self.symbol}: ========== END TRADING CYCLE (orders fetch failed) ==========")
+                return
+
             # --- Section: Buy Ladder ---
             logging.info(f"{self.symbol}: --- Buy Ladder ---")
             self.place_buy_ladder()
