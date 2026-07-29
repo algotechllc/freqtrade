@@ -73,7 +73,14 @@
     "chat_id": ""
   },
   "api_server": {
-    "enabled": false
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "verbosity": "error",
+    "jwt_secret_key": "local-dev-jwt-secret-change-before-server-deploy",
+    "ws_token": "local-dev-ws-token-change-before-server-deploy",
+    "username": "freqtrader",
+    "password": "SuperSecurePassword"
   },
   "bot_name": "freqtrade-spot-ladder-hyperliquid",
   "initial_state": "running",
