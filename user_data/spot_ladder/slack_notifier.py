@@ -71,21 +71,21 @@ class SlackNotifier:
             amount = float(row.get("amount") or 0)
             rate = float(row.get("rate") or 0)
             level = row.get("level_pct")
-            oid = row.get("order_id") or ""
             extra = f" ({level}%)" if level is not None else ""
-            lines.append(f"• {amount:.4f} @ {rate:.4f}{extra} `{oid}`")
+            notional = amount * rate
+            lines.append(f"• {amount:.2f} @ ${rate:.4f}{extra}  (${notional:.2f})")
         header = f"*{side} ladder* ({len(orders)} orders)"
         return header + "\n" + "\n".join(lines[:25])
 
     def notify_buy_order_placed(
         self, symbol: str, amount: float, rate: float, order_id: str = None
     ):
-        self._post(f"{symbol}: buy placed {amount:.4f} @ {rate:.4f} `{order_id or ''}`")
+        self._post(f"{symbol}: buy placed {amount:.2f} @ ${rate:.4f}")
 
     def notify_sell_order_placed(
         self, symbol: str, amount: float, rate: float, order_id: str = None
     ):
-        self._post(f"{symbol}: sell placed {amount:.4f} @ {rate:.4f} `{order_id or ''}`")
+        self._post(f"{symbol}: sell placed {amount:.2f} @ ${rate:.4f}")
 
     def notify_buy_ladder_recalculated(self, symbol: str, orders: list, current_price: float):
         if not orders:
@@ -135,10 +135,10 @@ class SlackNotifier:
         )
 
     def notify_order_cancelled(self, symbol: str, order_id: str, reason: str = ""):
-        self._post(f"{symbol}: order cancelled `{order_id}` {reason}".strip())
+        self._post(f"{symbol}: order cancelled {reason}".strip())
 
     def notify_order_updated(self, symbol: str, order_id: str, new_rate: float):
-        self._post(f"{symbol}: order `{order_id}` updated → {new_rate:.4f}")
+        self._post(f"{symbol}: order repriced → ${new_rate:.4f}")
 
     def notify_error(self, symbol: str, error: str):
         self._post(f":warning: {symbol}: {error}")
