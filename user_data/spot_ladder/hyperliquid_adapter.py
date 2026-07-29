@@ -164,10 +164,8 @@ class HyperliquidExchangeAdapter:
     def _get_open_orders(self) -> list[dict[str, Any]]:
         """Open orders for this pair (dry-run store or exchange API)."""
         if self.exchange._config.get("dry_run"):
-            from spot_ladder.dry_run_balances import refresh_dry_order_fills
-
-            refresh_dry_order_fills(self.exchange, self.pair)
-            self._persist_dry_orders()
+            # Fill checks run once per cycle in compute_dry_run_balances_flat (single L2 fetch).
+            # Do not refresh/persist here — get_orders is called many times per cycle.
             return [
                 o
                 for o in self.exchange._dry_run_open_orders.values()

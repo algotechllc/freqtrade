@@ -30,18 +30,45 @@ def _order_fee_cost(order: dict[str, Any]) -> float:
     return 0.0
 
 
-def refresh_dry_order_fills(exchange: Exchange, pair: str) -> None:
-    """Re-run dry-run limit fill checks for all orders on this pair."""
+def refresh_dry_order_fills(exchange: Exchange, pair: str) -> bool:
+    """
+    Re-run dry-run limit fill checks for open orders on this pair.
+
+    Fetches the L2 book once and reuses it — calling check_dry_limit_order_filled
+    without an orderbook would hit fetch_l2_order_book per order (very slow on HL).
+
+    Returns True if any order status/fill fields changed.
+    """
     if not exchange._config.get("dry_run"):
-        return
+        return False
     store = exchange._dry_run_open_orders
-    for order_id, order in list(store.items()):
-        if order.get("symbol") != pair:
-            continue
+    open_orders = [
+        (oid, o)
+        for oid, o in list(store.items())
+        if o.get("symbol") == pair and (o.get("status") or "open") == "open"
+    ]
+    if not open_orders:
+        return False
+
+    orderbook = None
+    if exchange.exchange_has("fetchL2OrderBook"):
         try:
-            store[order_id] = exchange.check_dry_limit_order_filled(order)
+            orderbook = exchange.fetch_l2_order_book(pair, 1)
+        except Exception as e:
+            logger.debug("dry_run L2 fetch failed for %s: %s", pair, e)
+
+    changed = False
+    for order_id, order in open_orders:
+        before_status = order.get("status")
+        before_filled = order.get("filled")
+        try:
+            updated = exchange.check_dry_limit_order_filled(order, orderbook=orderbook)
+            store[order_id] = updated
+            if updated.get("status") != before_status or updated.get("filled") != before_filled:
+                changed = True
         except Exception as e:
             logger.debug("dry_run fill refresh failed for %s: %s", order_id, e)
+    return changed
 
 
 def _apply_closed_dry_orders(
@@ -142,16 +169,17 @@ def compute_dry_run_balances_flat(
     are applied only if their IDs are not already recorded in JSON (avoids
     double-counting seed lots + fills that OrderManager already saved).
     """
-    refresh_dry_order_fills(exchange, pair)
-    # Persist fill-status changes (open → closed) so restarts keep the same book as LIVE.
-    try:
-        from spot_ladder.dry_run_order_store import save_dry_run_orders
+    fills_changed = refresh_dry_order_fills(exchange, pair)
+    # Persist only when a fill closed an order (not on every cycle).
+    if fills_changed:
+        try:
+            from spot_ladder.dry_run_order_store import save_dry_run_orders
 
-        state_dir = os.path.dirname(filled_orders_path) if filled_orders_path else ""
-        if state_dir:
-            save_dry_run_orders(exchange, pair, state_dir, base_currency)
-    except Exception as e:
-        logger.debug("dry-run order persist after balance refresh failed: %s", e)
+            state_dir = os.path.dirname(filled_orders_path) if filled_orders_path else ""
+            if state_dir:
+                save_dry_run_orders(exchange, pair, state_dir, base_currency)
+        except Exception as e:
+            logger.debug("dry-run order persist after balance refresh failed: %s", e)
 
     dry_for_pair = [
         o for o in exchange._dry_run_open_orders.values() if o.get("symbol") == pair
