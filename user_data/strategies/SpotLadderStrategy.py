@@ -167,9 +167,9 @@ class SpotLadderStrategy(IStrategy):
         cfg = self._ladder_config or self._load_ladder_config()
         interval = float(cfg["trading"].get("loop_interval", 120))
         now = time.time()
-        if now - self._last_ladder_run < interval:
+        elapsed = now - self._last_ladder_run
+        if self._last_ladder_run and elapsed < interval:
             return
-        self._last_ladder_run = now
 
         if not cfg.get("safety", {}).get("trading_enabled", True):
             logger.debug("Spot ladder trading_enabled=false, skipping cycle")
@@ -187,6 +187,8 @@ class SpotLadderStrategy(IStrategy):
                 manager.process()
             except Exception as e:
                 logger.exception("Spot ladder process error (%s): %s", manager.symbol, e)
+
+        self._last_ladder_run = time.time()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe

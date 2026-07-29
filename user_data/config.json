@@ -86,7 +86,7 @@
   "initial_state": "running",
   "force_entry_enable": false,
   "internals": {
-    "process_throttle_secs": 120,
+    "process_throttle_secs": 5,
     "heartbeat_interval": 300
   },
   "add_config_files": ["config-private.json"]
