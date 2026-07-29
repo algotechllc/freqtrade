@@ -33,6 +33,32 @@ docker compose logs -f
 
 Updates: `git pull` then `docker compose restart freqtrade`. Do not overwrite `spot_ladder/state/*.json` or `config-private.json` when pulling.
 
+## Slack notifications (ladder bot)
+
+Uses the same `OrderManager` hooks as the legacy Telegram bot (`notify_order_filled`, ladder recalc messages, errors). **Not** Freqtrade’s built-in Telegram.
+
+1. In Slack: **Apps → Incoming Webhooks** → add to your channel → copy webhook URL.
+2. On the server, set the secret (preferred — keep out of git):
+
+   ```bash
+   # docker-compose.yml environment: section, or /etc/environment:
+   export SPOT_LADDER_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...'
+   ```
+
+   Or put `slack.webhook_url` in `spot_ladder/config.yaml` on the server only (do not commit).
+
+3. In `spot_ladder/config.yaml`: `notifications.provider: slack`, `notifications.dry_run_label: true` (prefixes `*[DRY-RUN]*` while `dry_run: true` in `config.json`).
+4. Restart: `docker compose up -d --force-recreate`
+5. Confirm startup log: `Slack ladder notifications enabled`
+
+**Daily summary:** set `reporting.enabled: true`, then cron (UTC example):
+
+```bash
+0 0 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py
+```
+
+To match your old Telegram formatting exactly, copy message text from your legacy `telegram_notifier.py` into `spot_ladder/slack_notifier.py` (method bodies only — call sites stay the same).
+
 ## Stay current with upstream freqtrade
 
 ```bash

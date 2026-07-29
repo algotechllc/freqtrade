@@ -78,14 +78,14 @@ class SpotLadderStrategy(IStrategy):
 
     def _init_managers(self) -> None:
         from spot_ladder.hyperliquid_adapter import HyperliquidExchangeAdapter
+        from spot_ladder.notifier_factory import create_ladder_notifier
         from spot_ladder.order_manager import OrderManager
-        from spot_ladder.telegram_notifier import TelegramNotifier
 
         if self.dp._exchange is None:
             raise RuntimeError("Exchange not available on DataProvider")
 
         self._ladder_config = self._load_ladder_config()
-        notifier = TelegramNotifier()
+        notifier = create_ladder_notifier(self._ladder_config, self.config)
         symbols = self._ladder_config["trading"]["symbols"]
 
         self._managers = []

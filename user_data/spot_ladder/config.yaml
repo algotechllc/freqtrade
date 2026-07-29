@@ -6,6 +6,16 @@ paths:
 ccxt_pairs:
   XRP/USDC: XRP/USDC:USDC
 
+# Ladder alerts (legacy bot used Telegram; this fork posts to Slack).
+notifications:
+  provider: slack
+  dry_run_label: true
+
+slack:
+  webhook_url: ""
+  username: "Spot Ladder"
+  icon_emoji: ":chart_with_upwards_trend:"
+
 telegram:
   bot_token: ""
   chat_id: ""
@@ -119,3 +129,5 @@ skim:
 reporting:
   enabled: false
   ledger_path: spot_ladder/reporting
+  # Cron example (enable reporting.enabled first):
+  # 0 0 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py

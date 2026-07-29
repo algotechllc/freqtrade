@@ -1,4 +1,4 @@
-"""No-op notifier placeholder (Slack notifications planned later)."""
+"""No-op notifier when notifications.provider=none (Slack is in slack_notifier.py)."""
 
 import logging
 from typing import Any, Optional
