@@ -20,6 +20,10 @@ services:
     #   dockerfile: "./docker/Dockerfile.custom"
     restart: unless-stopped
     container_name: freqtrade
+    env_file:
+      - .env
+    environment:
+      SPOT_LADDER_SLACK_WEBHOOK_URL: ${SPOT_LADDER_SLACK_WEBHOOK_URL:-}
     volumes:
       - "./user_data:/freqtrade/user_data"
     # API server disabled in config (spot ladder does not use FreqUI).

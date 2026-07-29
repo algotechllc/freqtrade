@@ -29,6 +29,11 @@ def create_ladder_notifier(ladder_config: dict[str, Any], freqtrade_config: dict
         return TelegramNotifier()
 
     if provider == "slack":
+        if not webhook:
+            logger.warning(
+                "Slack webhook missing: set SPOT_LADDER_SLACK_WEBHOOK_URL in container env "
+                "(docker compose .env) or slack.webhook_url in spot_ladder/config.yaml"
+            )
         notifier = SlackNotifier(
             webhook_url=webhook,
             dry_run=dry_run,
