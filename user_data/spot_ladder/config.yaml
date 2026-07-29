@@ -1,0 +1,121 @@
+# Ladder configuration for Hyperliquid XRP/USDC (XRP perp in CCXT: XRP/USDC:USDC).
+paths:
+  state_dir: spot_ladder/state
+
+# Logical ladder symbol -> Freqtrade/ccxt market id
+ccxt_pairs:
+  XRP/USDC: XRP/USDC:USDC
+
+telegram:
+  bot_token: ""
+  chat_id: ""
+  notify_rebalancing: false
+
+trading:
+  base_currency: USDC
+  balance_percentage_per_symbol: 0.9
+  symbols:
+    - XRP/USDC
+
+  buy_levels:
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    - 4.0
+    - 5.0
+    - 7.0
+    - 10.0
+    - 15.0
+
+  sell_levels:
+    - 3.0
+    - 4.0
+    - 5.0
+    - 6.0
+    - 7.0
+    - 8.0
+    - 9.0
+    - 10.0
+    - 12.0
+    - 15.0
+    - 18.0
+    - 20.0
+    - 25.0
+    - 30.0
+    - 50.0
+
+  mean_reversion:
+    enabled: true
+    # Working sells above current price when underwater (price < avg entry); Core handles recovery.
+    working_ladder_enabled: true
+    working_position_pct: 0.01
+    working_sell_levels:
+      - 1.5
+      - 1.75
+      - 2.0
+      - 2.25
+      - 2.5
+      - 2.75
+    cancel_working_threshold_pct: 10.0
+    working_price_update_threshold: 3.0
+
+  order_size_distribution: weighted
+  buy_order_distribution: weighted
+  sell_order_distribution: equal
+  small_position_multiplier: 1.0
+  small_position_threshold: 0.5
+
+  price_update_threshold: 4.0
+  price_update_short_window: 1800
+  price_update_time_window: 3600
+  price_update_quick_threshold: 5.0
+  price_update_quick_window: 600
+
+  min_order_size: 10.0
+  loop_interval: 120
+
+  buy_fee_percentage: 0.0004
+  sell_fee_percentage: 0.0004
+
+  increased_capital_threshold: 50.0
+  increased_capital_observation_period: 600
+  sell_ladder_rebalance_threshold_pct: 5.0
+
+price_elevation:
+  enabled: true
+  window_hours: 2160
+  tiers:
+    - max_percentile: 20
+      allocation: 100
+      skip_levels: 0
+    - max_percentile: 40
+      allocation: 85
+      skip_levels: 0
+    - max_percentile: 60
+      allocation: 70
+      skip_levels: 1
+    - max_percentile: 80
+      allocation: 55
+      skip_levels: 2
+    - max_percentile: 100
+      allocation: 40
+      skip_levels: 3
+
+safety:
+  max_buy_orders: 10
+  max_sell_orders: 15
+  max_core_sell_orders: 15
+  max_working_sell_orders: 6
+  max_position_size: 0
+  trading_enabled: true
+
+skim:
+  enabled: false
+  profit_percentage: 0.2
+  tokens: []
+  min_skim_amount: 0.2
+
+reporting:
+  enabled: false
+  ledger_path: spot_ladder/reporting

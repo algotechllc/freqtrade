@@ -12,6 +12,21 @@ user_data/*
 user_data/freqaimodels/*
 user_data/models/*
 user_data/notebooks/*
+# Spot ladder fork — deployable user_data (runtime state/logs still ignored below)
+!user_data/README.md
+!user_data/strategies/
+!user_data/strategies/**
+!user_data/spot_ladder/
+!user_data/spot_ladder/**
+user_data/spot_ladder/**/__pycache__/
+user_data/spot_ladder/state/*
+!user_data/spot_ladder/state/.gitkeep
+!user_data/spot_ladder/state/*.example
+user_data/logs/*
+!user_data/logs/.gitkeep
+!user_data/config.json
+!user_data/config-private.json.example
+user_data/config-private.json
 freqtrade-plot.html
 freqtrade-profit-plot.html
 freqtrade/rpc/api_server/ui/*

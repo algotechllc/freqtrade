@@ -1,0 +1,122 @@
+{
+  "symbol": "XRP/USDC",
+  "cointype": "XRP",
+  "market": "USDC",
+  "last_updated": "2026-07-29T00:00:00+00:00",
+  "metadata": {
+    "note": "Copy to filled_orders_XRP.json for dry-run seed. 1000 XRP across 10 buys; pair with dry_run_wallet 2550 for $1000 USDC remaining (1550 spent on fills)."
+  },
+  "buy_orders": [
+    {
+      "order_id": "seed-buy-001",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.1,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-01T00:00:00+00:00",
+      "total_usd": 110.0,
+      "coin_balance_at_save": 100.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-002",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.2,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-02T00:00:00+00:00",
+      "total_usd": 120.0,
+      "coin_balance_at_save": 200.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-003",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.3,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-03T00:00:00+00:00",
+      "total_usd": 130.0,
+      "coin_balance_at_save": 300.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-004",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.4,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-04T00:00:00+00:00",
+      "total_usd": 140.0,
+      "coin_balance_at_save": 400.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-005",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.5,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-05T00:00:00+00:00",
+      "total_usd": 150.0,
+      "coin_balance_at_save": 500.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-006",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.6,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-06T00:00:00+00:00",
+      "total_usd": 160.0,
+      "coin_balance_at_save": 600.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-007",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.7,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-07T00:00:00+00:00",
+      "total_usd": 170.0,
+      "coin_balance_at_save": 700.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-008",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.8,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-08T00:00:00+00:00",
+      "total_usd": 180.0,
+      "coin_balance_at_save": 800.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-009",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 1.9,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-09T00:00:00+00:00",
+      "total_usd": 190.0,
+      "coin_balance_at_save": 900.0,
+      "consumed_amount": 0
+    },
+    {
+      "order_id": "seed-buy-010",
+      "symbol": "XRP/USDC",
+      "amount": 100.0,
+      "rate": 2.0,
+      "market": "USDC",
+      "fill_timestamp": "2026-06-10T00:00:00+00:00",
+      "total_usd": 200.0,
+      "coin_balance_at_save": 1000.0,
+      "consumed_amount": 0
+    }
+  ],
+  "sell_orders": []
+}
