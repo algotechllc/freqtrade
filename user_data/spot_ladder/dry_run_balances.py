@@ -44,10 +44,10 @@ def refresh_dry_order_fills(exchange: Exchange, pair: str) -> None:
             logger.debug("dry_run fill refresh failed for %s: %s", order_id, e)
 
 
-def _ledger_from_dry_orders(orders: list[dict[str, Any]], start_wallet: float) -> tuple[float, float]:
-    """Return (quote_balance, base_balance) after applying closed dry orders."""
-    usdc = float(start_wallet)
-    base = 0.0
+def _apply_closed_dry_orders(
+    orders: list[dict[str, Any]], usdc: float, base: float
+) -> tuple[float, float]:
+    """Apply closed dry-run order fills on top of existing quote/base balances."""
     closed = [o for o in orders if (o.get("status") or "") == "closed"]
     closed.sort(key=lambda o: int(o.get("timestamp") or 0))
 
@@ -69,6 +69,11 @@ def _ledger_from_dry_orders(orders: list[dict[str, Any]], start_wallet: float) -
             base -= filled
 
     return max(usdc, 0.0), max(base, 0.0)
+
+
+def _ledger_from_dry_orders(orders: list[dict[str, Any]], start_wallet: float) -> tuple[float, float]:
+    """Return (quote_balance, base_balance) after applying closed dry orders from start_wallet."""
+    return _apply_closed_dry_orders(orders, float(start_wallet), 0.0)
 
 
 def _ledger_from_filled_orders_json(path: str, start_wallet: float) -> tuple[float, float]:
@@ -121,12 +126,20 @@ def compute_dry_run_balances_flat(
         o for o in exchange._dry_run_open_orders.values() if o.get("symbol") == pair
     ]
 
-    if dry_for_pair:
-        usdc, base = _ledger_from_dry_orders(dry_for_pair, start_wallet)
-        source = "dry-run orders"
-    else:
+    has_json = os.path.isfile(filled_orders_path)
+    if has_json:
         usdc, base = _ledger_from_filled_orders_json(filled_orders_path, start_wallet)
-        source = "filled_orders JSON" if os.path.isfile(filled_orders_path) else "dry_run_wallet"
+        source = "filled_orders JSON"
+    else:
+        usdc, base = float(start_wallet), 0.0
+        source = "dry_run_wallet"
+
+    if dry_for_pair:
+        closed = [o for o in dry_for_pair if (o.get("status") or "") == "closed"]
+        if closed:
+            usdc, base = _apply_closed_dry_orders(dry_for_pair, usdc, base)
+            source = f"{source} + closed dry-run orders"
+        # Open-only dry orders do not change holdings; JSON seed (or start_wallet) stays as-is.
 
     stake = stake_currency.upper()
     coin = base_currency.upper()
