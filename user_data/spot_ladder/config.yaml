@@ -129,7 +129,7 @@ skim:
   min_skim_amount: 0.2
 
 reporting:
-  enabled: false
+  enabled: true
   ledger_path: spot_ladder/reporting
   # summary_date_offset_days: 0  # e.g. -1 for yesterday when cron runs after midnight UTC
   # Cron example (enable reporting.enabled first):
