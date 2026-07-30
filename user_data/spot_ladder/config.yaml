@@ -10,6 +10,8 @@ ccxt_pairs:
 notifications:
   provider: slack
   dry_run_label: true
+  # Buy/sell ladder replant summaries (dry-run and live). Fills/errors still notify.
+  notify_rebalancing: false
 
 slack:
   webhook_url: ""
@@ -19,7 +21,6 @@ slack:
 telegram:
   bot_token: ""
   chat_id: ""
-  notify_rebalancing: false
 
 trading:
   base_currency: USDC
@@ -130,5 +131,6 @@ skim:
 reporting:
   enabled: false
   ledger_path: spot_ladder/reporting
+  # summary_date_offset_days: 0  # e.g. -1 for yesterday when cron runs after midnight UTC
   # Cron example (enable reporting.enabled first):
   # 0 0 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py

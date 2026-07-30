@@ -7,8 +7,14 @@ from typing import Any, Optional
 class TelegramNotifier:
     """Stub: preserves OrderManager call sites without sending messages."""
 
-    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
+    def __init__(
+        self,
+        bot_token: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        notify_rebalancing: bool = False,
+    ):
         self.enabled = False
+        self.notify_rebalancing = notify_rebalancing
 
     def notify_buy_order_placed(self, symbol: str, amount: float, rate: float, order_id: str = None):
         logging.debug("notify_buy_order_placed(%s) skipped (notifications disabled)", symbol)
@@ -17,6 +23,8 @@ class TelegramNotifier:
         logging.debug("notify_sell_order_placed(%s) skipped", symbol)
 
     def notify_buy_ladder_recalculated(self, symbol: str, orders: list, current_price: float):
+        if not self.notify_rebalancing:
+            return
         logging.debug("notify_buy_ladder_recalculated(%s, %s orders)", symbol, len(orders))
 
     def notify_sell_ladder_recalculated(
@@ -27,6 +35,8 @@ class TelegramNotifier:
         current_price: float = 0,
         order_type: str = "Core",
     ):
+        if not self.notify_rebalancing:
+            return
         logging.debug("notify_sell_ladder_recalculated(%s, %s, %s orders)", symbol, order_type, len(orders))
 
     def notify_order_filled(self, symbol: str, side: str, amount: float, rate: float, **kwargs: Any):

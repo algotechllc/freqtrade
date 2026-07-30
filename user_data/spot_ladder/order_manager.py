@@ -1912,6 +1912,7 @@ class OrderManager:
                                 amount=amount,
                                 rate=rate,
                                 avg_entry=avg_entry_for_notify,
+                                profit_usd=sell_profit,
                             )
                         else:
                             logging.info(
@@ -2998,10 +2999,11 @@ class OrderManager:
         # Calculate position metrics using EXACT SAME method as daily summary
         # Import and use the same function that daily summary uses for consistency
         try:
-            from scripts.daily_summary import calculate_average_entry_from_stored_orders
+            from spot_ladder.daily_summary import calculate_average_entry_from_stored_orders
             avg_entry_ds, fifo_coins, total_cost_ds = calculate_average_entry_from_stored_orders(
                 cointype=self.cointype,
-                current_balance=self.coin_balance
+                current_balance=self.coin_balance,
+                state_dir=self._state_dir,
             )
             # Scale cost basis to match actual balance (same as daily summary)
             if fifo_coins > 0 and self.coin_balance > 0:
@@ -6660,6 +6662,7 @@ class OrderManager:
                                         amount=missing_order.amount,
                                         rate=missing_order.rate,
                                         avg_entry=avg_entry_for_notify,
+                                        profit_usd=sell_profit,
                                         daily_skim_purchases=self.daily_skim_purchases if self.daily_skim_purchases else None,
                                         api=self.api
                                     )

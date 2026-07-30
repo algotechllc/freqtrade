@@ -21,12 +21,14 @@ class SlackNotifier:
         *,
         dry_run: bool = False,
         dry_run_label: bool = True,
+        notify_rebalancing: bool = False,
         username: str = "Spot Ladder",
         icon_emoji: str = ":chart_with_upwards_trend:",
     ):
         self.webhook_url = (webhook_url or os.environ.get("SPOT_LADDER_SLACK_WEBHOOK_URL") or "").strip()
         self.dry_run = dry_run
         self.dry_run_label = dry_run_label
+        self.notify_rebalancing = notify_rebalancing
         self.username = username
         self.icon_emoji = icon_emoji
         self.enabled = bool(self.webhook_url)
@@ -88,6 +90,9 @@ class SlackNotifier:
         self._post(f"{symbol}: sell placed {amount:.2f} @ ${rate:.4f}")
 
     def notify_buy_ladder_recalculated(self, symbol: str, orders: list, current_price: float):
+        if not self.notify_rebalancing:
+            logger.debug("%s: buy ladder rebalance Slack skipped (notify_rebalancing=false)", symbol)
+            return
         if not orders:
             return
         self._post(
@@ -103,6 +108,13 @@ class SlackNotifier:
         current_price: float = 0,
         order_type: str = "Core",
     ):
+        if not self.notify_rebalancing:
+            logger.debug(
+                "%s: %s sell ladder rebalance Slack skipped (notify_rebalancing=false)",
+                symbol,
+                order_type,
+            )
+            return
         if not orders:
             return
         ctx = f"avg {avg_entry:.4f}, mkt {current_price:.4f}" if avg_entry else f"mkt {current_price:.4f}"
@@ -112,11 +124,37 @@ class SlackNotifier:
         )
 
     def notify_order_filled(self, symbol: str, side: str, amount: float, rate: float, **kwargs: Any):
-        side_u = side.upper()
-        avg_entry = kwargs.get("avg_entry")
-        msg = f"{symbol}: *{side_u} FILLED* {amount:.4f} @ {rate:.4f}"
-        if avg_entry and side.lower() == "sell":
-            msg += f" (cost basis ~{float(avg_entry):.4f})"
+        coin = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+        side_l = side.lower()
+        total_usd = amount * rate
+
+        if side_l == "buy":
+            msg = (
+                f"{symbol}: *BUY FILLED* "
+                f"{amount:.4f} {coin} @ ${rate:.4f} "
+                f"(${total_usd:.2f} spent)"
+            )
+        elif side_l == "sell":
+            avg_entry = kwargs.get("avg_entry")
+            profit_usd = kwargs.get("profit_usd")
+            msg = (
+                f"{symbol}: *SELL FILLED* "
+                f"{amount:.4f} {coin} @ ${rate:.4f}"
+            )
+            if avg_entry is not None and float(avg_entry) > 0:
+                msg += f" (cost basis ~${float(avg_entry):.4f})"
+            if profit_usd is not None:
+                p = float(profit_usd)
+            elif avg_entry is not None and float(avg_entry) > 0:
+                p = total_usd - float(avg_entry) * amount
+            else:
+                p = None
+            if p is not None:
+                sign = "+" if p >= 0 else "-"
+                msg += f" · profit {sign}${abs(p):.2f}"
+        else:
+            msg = f"{symbol}: *{side.upper()} FILLED* {amount:.4f} @ ${rate:.4f}"
+
         daily_skim = kwargs.get("daily_skim_purchases")
         if daily_skim:
             msg += f"\n_skim activity recorded_"
@@ -147,9 +185,13 @@ class SlackNotifier:
         self._post(message)
 
     def notify_daily_summary(self, summary: dict, symbol: str = "XRP/USDC", **kwargs: Any):
+        text = summary.get("text")
+        if text:
+            self._post(text)
+            return
         lines = [f"*Daily summary — {symbol}*"]
         for key, value in summary.items():
-            if value is None:
+            if value is None or key == "text":
                 continue
             lines.append(f"• *{key}*: {value}")
         self._post("\n".join(lines))
