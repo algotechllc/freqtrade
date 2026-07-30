@@ -275,16 +275,29 @@ def _quote_balance_from_ledger(
     return max(usdc, 0.0)
 
 
+def _is_seed_ledger_row(row: dict) -> bool:
+    """Dry-run / test seed lots are not live trading history."""
+    oid = str(row.get("order_id") or "")
+    if oid.startswith("seed-"):
+        return True
+    return bool(row.get("is_seed"))
+
+
 def _trading_days(first: Optional[date], last: date) -> int:
     if not first:
         return 1
     return max(1, (last - first).days + 1)
 
 
-def _first_activity_date(buys: list[dict], sells: list[dict]) -> Optional[date]:
+def _first_activity_date(
+    buys: list[dict], sells: list[dict], tz: ZoneInfo
+) -> Optional[date]:
+    """First live fill date (excludes seed lots), in reporting timezone."""
     dates: list[date] = []
     for row in buys + sells:
-        d = _ts_date(row.get("fill_timestamp", ""))
+        if _is_seed_ledger_row(row):
+            continue
+        d = _fill_date_in_tz(row.get("fill_timestamp", ""), tz)
         if d:
             dates.append(d)
     return min(dates) if dates else None
@@ -542,7 +555,7 @@ def build_daily_summary(
     buy_count, buy_coins, buy_avg = _activity_stats(buys, report_date, tz)
     sell_count, sell_coins, sell_avg = _activity_stats(sells, report_date, tz)
 
-    first_day = _first_activity_date(buys, sells)
+    first_day = _first_activity_date(buys, sells, tz)
     trading_days = _trading_days(first_day, report_date)
 
     open_sells = _open_sell_orders(state_dir, cointype, ccxt_pair)
