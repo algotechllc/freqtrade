@@ -486,6 +486,25 @@ def build_daily_summary(
         report_date = _resolve_report_date(reporting, tz)
 
     filled_path = state_dir / f"filled_orders_{cointype}.json"
+
+    from spot_ladder.ledger_sell_sync import (  # noqa: WPS433
+        refresh_sell_fill_timestamps_from_dry_store,
+        sync_missing_sells_from_dry_run_store,
+    )
+
+    if filled_path.is_file():
+        refresh_sell_fill_timestamps_from_dry_store(
+            filled_path, state_dir, cointype, ccxt_pair
+        )
+        sync_missing_sells_from_dry_run_store(
+            filled_path,
+            state_dir,
+            cointype,
+            ccxt_pair,
+            symbol=symbol,
+            market=market,
+        )
+
     buys: list[dict] = []
     sells: list[dict] = []
     if filled_path.is_file():

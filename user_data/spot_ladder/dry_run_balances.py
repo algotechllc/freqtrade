@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from freqtrade.exchange import Exchange
@@ -28,6 +29,28 @@ def _order_fee_cost(order: dict[str, Any]) -> float:
     if isinstance(fee, dict):
         return float(fee.get("cost") or 0)
     return 0.0
+
+
+def dry_run_order_fill_timestamp(order: dict[str, Any]) -> str:
+    """Best-effort fill time for a closed dry-run order (not placement time)."""
+    closed_at = order.get("closed_at")
+    if closed_at:
+        return str(closed_at)
+    for key in ("lastTradeTimestamp", "datetime"):
+        ts = order.get(key)
+        if ts:
+            try:
+                ms = int(ts)
+                return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                continue
+    ts = order.get("timestamp")
+    if ts:
+        try:
+            return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            pass
+    return datetime.now(timezone.utc).isoformat()
 
 
 def refresh_dry_order_fills(exchange: Exchange, pair: str) -> bool:
@@ -63,6 +86,8 @@ def refresh_dry_order_fills(exchange: Exchange, pair: str) -> bool:
         before_filled = order.get("filled")
         try:
             updated = exchange.check_dry_limit_order_filled(order, orderbook=orderbook)
+            if updated.get("status") == "closed" and before_status != "closed":
+                updated["closed_at"] = datetime.now(timezone.utc).isoformat()
             store[order_id] = updated
             if updated.get("status") != before_status or updated.get("filled") != before_filled:
                 changed = True
@@ -232,14 +257,7 @@ def dry_run_completed_order_rows(
         if order.get("symbol") != pair or (order.get("status") or "") != "closed":
             continue
         side = _order_side(order)
-        from datetime import datetime, timezone
-
-        ts = order.get("timestamp")
-        if ts:
-            solddate = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).isoformat()
-        else:
-            # OrderManager sync uses solddate for Slack freshness; dry-run closes must have a stamp.
-            solddate = datetime.now(timezone.utc).isoformat()
+        solddate = dry_run_order_fill_timestamp(order)
         row = {
             "id": str(order.get("id", "")),
             "amount": float(order.get("filled") or order.get("amount") or 0),

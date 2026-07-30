@@ -1505,11 +1505,44 @@ class OrderManager:
                 f"actual: {self.coin_balance:.8f}, difference: {difference:+.8f} ({difference_pct:+.2f}%)"
             )
     
+    def _sync_sells_from_dry_run_store(self) -> None:
+        """Backfill sell_orders from persisted dry-run closed orders (same as daily summary)."""
+        try:
+            from pathlib import Path
+
+            from spot_ladder.ledger_sell_sync import (
+                refresh_sell_fill_timestamps_from_dry_store,
+                sync_missing_sells_from_dry_run_store,
+            )
+
+            pair = getattr(self.api, "pair", f"{self.cointype}/{self.market}:USDC")
+            filled_path = Path(self._get_filled_orders_file_path())
+            state_dir = Path(self._state_dir)
+            refresh_sell_fill_timestamps_from_dry_store(
+                filled_path, state_dir, self.cointype, pair
+            )
+            added = sync_missing_sells_from_dry_run_store(
+                filled_path,
+                state_dir,
+                self.cointype,
+                pair,
+                symbol=self.symbol,
+                market=self.market,
+            )
+            if added:
+                logging.info(
+                    f"{self.symbol}: Synced {added} sell fill(s) from dry-run order store into ledger"
+                )
+        except Exception as e:
+            logging.debug(f"{self.symbol}: Dry-run sell ledger sync skipped: {e}")
+
     def _detect_and_sync_missing_fills(self):
         """Detect missing fills by comparing current balance with stored orders
         and sync them from exchange fill history via the API adapter.
         Also checks for orders newer than the JSON's last_updated timestamp.
         """
+        self._sync_sells_from_dry_run_store()
+
         if self.coin_balance == 0:
             return
         
@@ -1846,27 +1879,8 @@ class OrderManager:
                     key = (round(amount, 8), round(rate, 4), solddate[:19] if solddate else '')
                     if key in existing_sell_keys:
                         continue
-                    # Apply same time filter as buy orders: skip old sells when syncing by time
-                    if json_last_updated and solddate:
-                        try:
-                            sell_date = datetime.fromisoformat(solddate.replace('Z', '+00:00'))
-                            if sell_date.tzinfo is None:
-                                sell_date = sell_date.replace(tzinfo=timezone.utc)
-                            last_updated_aware = json_last_updated
-                            if last_updated_aware.tzinfo is None:
-                                last_updated_aware = last_updated_aware.replace(tzinfo=timezone.utc)
-                            if sell_date <= last_updated_aware:
-                                logging.debug(
-                                    f"{self.symbol}: Skipping old API sell {api_id} "
-                                    f"(date {solddate[:19]} <= last_updated {json_last_updated.isoformat()}) "
-                                    f"- not a new fill"
-                                )
-                                continue
-                        except (ValueError, AttributeError, TypeError):
-                            continue
-                    elif not solddate:
-                        logging.debug(f"{self.symbol}: Skipping API sell {api_id} with no solddate")
-                        continue
+                    if not solddate:
+                        solddate = datetime.now(timezone.utc).isoformat()
                     missing_sells.append(api_sell)
                 if missing_sells:
                     def _sell_sort_key(api_sell: Dict) -> datetime:
@@ -6612,6 +6626,18 @@ class OrderManager:
                                     if completed and completed.get('solddate')
                                     else datetime.now(timezone.utc).isoformat()
                                 )
+                                # Placement time on dry-run orders is not the fill time.
+                                if completed and completed.get('solddate'):
+                                    try:
+                                        fill_dt = datetime.fromisoformat(
+                                            fill_timestamp.replace('Z', '+00:00')
+                                        )
+                                        if fill_dt.tzinfo is None:
+                                            fill_dt = fill_dt.replace(tzinfo=timezone.utc)
+                                        if (datetime.now(timezone.utc) - fill_dt).total_seconds() > 86400:
+                                            fill_timestamp = datetime.now(timezone.utc).isoformat()
+                                    except (ValueError, TypeError, AttributeError):
+                                        fill_timestamp = datetime.now(timezone.utc).isoformat()
                                 if completed:
                                     missing_order.amount = fill_amount
                                     missing_order.rate = fill_rate
