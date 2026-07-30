@@ -60,7 +60,7 @@ trading:
     enabled: true
     # Working sells above current price when underwater (price < avg entry); Core handles recovery.
     working_ladder_enabled: true
-    working_position_pct: 0.05
+    working_position_pct: 0.1
     working_sell_levels:
       - 1.5
       - 1.75
