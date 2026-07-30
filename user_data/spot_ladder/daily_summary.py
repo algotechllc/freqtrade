@@ -38,12 +38,14 @@ def _ts_date(value: str) -> Optional[date]:
 
 def _report_timezone(reporting: dict[str, Any]) -> ZoneInfo:
     """Timezone for calendar-day boundaries (trading activity / realized P&L)."""
-    name = (reporting.get("timezone") or os.environ.get("TZ") or "America/New_York").strip()
+    name = (reporting.get("timezone") or os.environ.get("TZ") or "UTC").strip()
+    if name.upper() in ("UTC", "GMT", "ETC/UTC"):
+        return timezone.utc
     try:
         return ZoneInfo(name)
     except Exception:
-        logger.warning("Invalid reporting.timezone %r — using America/New_York", name)
-        return ZoneInfo("America/New_York")
+        logger.warning("Invalid reporting.timezone %r — using UTC", name)
+        return timezone.utc
 
 
 def _fill_date_in_tz(value: str, tz: ZoneInfo) -> Optional[date]:
@@ -55,9 +57,9 @@ def _fill_date_in_tz(value: str, tz: ZoneInfo) -> Optional[date]:
 
 def _resolve_report_date(reporting: dict[str, Any], tz: ZoneInfo) -> date:
     """
-    Default: previous local calendar day (run today → report yesterday).
+    Default: previous calendar day in reporting.timezone (run today → report yesterday).
 
-    Override with reporting.summary_date_offset_days (0 = local today, -1 = yesterday).
+    Override with reporting.summary_date_offset_days (0 = today, -1 = yesterday).
     """
     offset_days = int(reporting.get("summary_date_offset_days", -1))
     local_today = datetime.now(tz).date()

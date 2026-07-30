@@ -131,9 +131,9 @@ skim:
 reporting:
   enabled: true
   ledger_path: spot_ladder/reporting
-  # Calendar day for buys/sells/realized P&L (match your server / cron timezone).
-  timezone: America/New_York
-  # Run today → report yesterday (-1). Use 0 for the current local day.
+  # Calendar day for buys/sells/realized P&L (fill timestamps converted to this zone).
+  timezone: UTC
+  # Run today → report yesterday (-1). Use 0 for the current UTC day.
   summary_date_offset_days: -1
-  # Cron example (enable reporting.enabled first; run once each morning local time):
-  # 0 6 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py
+  # Cron example (9:35 UTC ≈ same wall-clock as legacy; activity buckets are UTC):
+  # 35 9 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py >> /home/ubuntu/freqtrade/user_data/logs/daily_summary.log 2>&1
