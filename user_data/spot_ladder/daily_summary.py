@@ -11,9 +11,10 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,34 @@ def _parse_ts(value: str) -> Optional[datetime]:
 def _ts_date(value: str) -> Optional[date]:
     dt = _parse_ts(value)
     return dt.date() if dt else None
+
+
+def _report_timezone(reporting: dict[str, Any]) -> ZoneInfo:
+    """Timezone for calendar-day boundaries (trading activity / realized P&L)."""
+    name = (reporting.get("timezone") or os.environ.get("TZ") or "America/New_York").strip()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning("Invalid reporting.timezone %r — using America/New_York", name)
+        return ZoneInfo("America/New_York")
+
+
+def _fill_date_in_tz(value: str, tz: ZoneInfo) -> Optional[date]:
+    dt = _parse_ts(value)
+    if not dt:
+        return None
+    return dt.astimezone(tz).date()
+
+
+def _resolve_report_date(reporting: dict[str, Any], tz: ZoneInfo) -> date:
+    """
+    Default: previous local calendar day (run today → report yesterday).
+
+    Override with reporting.summary_date_offset_days (0 = local today, -1 = yesterday).
+    """
+    offset_days = int(reporting.get("summary_date_offset_days", -1))
+    local_today = datetime.now(tz).date()
+    return local_today + timedelta(days=offset_days)
 
 
 def _fmt_money(amount: float, *, signed: bool = True) -> str:
@@ -204,9 +233,13 @@ def _replay_sell_profits(
     return results
 
 
-def _activity_stats(orders: list[dict], report_date: date) -> tuple[int, float, float]:
-    """Count, total coins, volume-weighted avg rate for fills on report_date."""
-    day_orders = [o for o in orders if _ts_date(o.get("fill_timestamp", "")) == report_date]
+def _activity_stats(
+    orders: list[dict], report_date: date, tz: ZoneInfo
+) -> tuple[int, float, float]:
+    """Count, total coins, volume-weighted avg rate for fills on report_date (local tz)."""
+    day_orders = [
+        o for o in orders if _fill_date_in_tz(o.get("fill_timestamp", ""), tz) == report_date
+    ]
     count = len(day_orders)
     if not count:
         return (0, 0.0, 0.0)
@@ -446,15 +479,11 @@ def build_daily_summary(
     sell_fee = float(trading.get("sell_fee_percentage", 0.0004))
     mean_reversion = bool((trading.get("mean_reversion") or {}).get("enabled", False))
     skim_enabled = bool((ladder_cfg.get("skim") or {}).get("enabled", False))
+    reporting = ladder_cfg.get("reporting") or {}
+    tz = _report_timezone(reporting)
 
     if report_date is None:
-        reporting = ladder_cfg.get("reporting") or {}
-        offset_days = int(reporting.get("summary_date_offset_days", 0))
-        report_date = (datetime.now(timezone.utc).date())
-        if offset_days:
-            from datetime import timedelta
-
-            report_date = report_date + timedelta(days=offset_days)
+        report_date = _resolve_report_date(reporting, tz)
 
     filled_path = state_dir / f"filled_orders_{cointype}.json"
     buys: list[dict] = []
@@ -484,11 +513,13 @@ def build_daily_summary(
     sell_profits = _replay_sell_profits(buys, sells, buy_fee, sell_fee)
     cumulative = sum(p for _, p in sell_profits)
     realized_today = sum(
-        p for sell, p in sell_profits if _ts_date(sell.get("fill_timestamp", "")) == report_date
+        p
+        for sell, p in sell_profits
+        if _fill_date_in_tz(sell.get("fill_timestamp", ""), tz) == report_date
     )
 
-    buy_count, buy_coins, buy_avg = _activity_stats(buys, report_date)
-    sell_count, sell_coins, sell_avg = _activity_stats(sells, report_date)
+    buy_count, buy_coins, buy_avg = _activity_stats(buys, report_date, tz)
+    sell_count, sell_coins, sell_avg = _activity_stats(sells, report_date, tz)
 
     first_day = _first_activity_date(buys, sells)
     trading_days = _trading_days(first_day, report_date)
