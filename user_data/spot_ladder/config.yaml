@@ -86,8 +86,16 @@ trading:
   min_order_size: 10.0
   loop_interval: 120
 
-  buy_fee_percentage: 0.0004
-  sell_fee_percentage: 0.0004
+  # Hyperliquid trading fees (tier 0). Used for buy sizing, sell profitability checks,
+  # net P&L, Slack notifications, and daily summary — not read from exchange fills.
+  # We trade XRP/USDC:USDC (perp), not spot. Limit ladder orders usually fill as maker.
+  #   Perp maker (add):  0.015% = 0.00015 per side → ~0.03% round trip
+  #   Perp taker (cross): 0.045% = 0.00045 per side → ~0.09% round trip
+  #   Spot maker/taker:   0.040% / 0.070% — do not use for this bot
+  # For a conservative buffer (occasional taker fills), use 0.00045 for both sides.
+  # Not included: funding, staking discounts, volume tiers, referral rebates.
+  buy_fee_percentage: 0.00015
+  sell_fee_percentage: 0.00015
 
   increased_capital_threshold: 50.0
   increased_capital_observation_period: 600
