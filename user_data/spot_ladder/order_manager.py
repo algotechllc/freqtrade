@@ -115,6 +115,10 @@ class OrderManager:
         self.average_entry_price = 0.0
         self.total_invested = 0.0
         self.total_coins = 0.0
+
+        # Trading-cycle log buffer: one timestamp at cycle start (multi-line body), one at end
+        self._cycle_logging = False
+        self._cycle_log_buffer: List[str] = []
         
         # Track previous balance to verify fills
         self.previous_coin_balance = 0.0
@@ -221,7 +225,7 @@ class OrderManager:
         self._load_working_order_ids()
 
         if self.mean_reversion_enabled:
-            logging.info(
+            self._info(
                 f"{self.symbol}: Mean-reversion enabled — "
                 f"working_ladder={'on' if self.working_ladder_enabled else 'off'}, "
                 f"working_position_pct={self.working_position_pct * 100:.2f}%"
@@ -296,8 +300,29 @@ class OrderManager:
         self.working_ladder_enabled = mean_reversion_config.get('working_ladder_enabled', False)
         self.sell_ladder_rebalance_threshold = config['trading'].get('sell_ladder_rebalance_threshold_pct', 5.0) / 100.0
         
-        logging.info(f"{self.symbol}: Configuration updated (hot reload)")
+        self._info(f"{self.symbol}: Configuration updated (hot reload)")
     
+    def _info(self, message: str, *args) -> None:
+        """Log info, or buffer during an active trading cycle (see _flush_cycle_log)."""
+        text = message % args if args else message
+        if self._cycle_logging:
+            self._cycle_log_buffer.append(text)
+        else:
+            logging.info(text)
+
+    def _begin_cycle_log(self) -> None:
+        self._cycle_logging = True
+        self._cycle_log_buffer = []
+
+    def _flush_cycle_log(self, suffix: str = "") -> None:
+        """Emit buffered cycle lines under one timestamp, then a separate END line."""
+        self._cycle_logging = False
+        end_line = f"{self.symbol}: ========== END TRADING CYCLE{suffix} =========="
+        if self._cycle_log_buffer:
+            logging.info("\n".join(self._cycle_log_buffer))
+        logging.info(end_line)
+        self._cycle_log_buffer = []
+
     def _get_filled_orders_file_path(self) -> str:
         """Get the full path to the filled orders file"""
         return self.filled_orders_file
@@ -316,7 +341,7 @@ class OrderManager:
                     order_ids = data.get('working_order_ids', [])
                     self._working_order_ids = set(order_ids)
                     if order_ids:
-                        logging.info(f"{self.symbol}: Loaded {len(order_ids)} Working order IDs from {self._working_orders_file}")
+                        self._info(f"{self.symbol}: Loaded {len(order_ids)} Working order IDs from {self._working_orders_file}")
             except Exception as e:
                 logging.warning(f"{self.symbol}: Failed to load Working order IDs from {file_path}: {e}")
                 self._working_order_ids = set()
@@ -682,7 +707,7 @@ class OrderManager:
                 )
                 return False
             
-            logging.info(f"{self.symbol}: ✓ Order {order_id} verified in completed orders API, proceeding with save")
+            self._info(f"{self.symbol}: ✓ Order {order_id} verified in completed orders API, proceeding with save")
         
         # Check for duplicates - allow same order_id if it's a partial fill (different balance)
         # but prevent duplicates where same order_id AND same balance (exact duplicate)
@@ -770,7 +795,7 @@ class OrderManager:
             }
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=2)
-            logging.info(f"{self.symbol}: Saved filled buy order {order_id} to {self.filled_orders_file} "
+            self._info(f"{self.symbol}: Saved filled buy order {order_id} to {self.filled_orders_file} "
                         f"({order.amount:.8f} @ {order.rate:.4f})")
             # Long-term performance ledger (signals / copy-trade reporting)
             if self._performance_tracker:
@@ -855,7 +880,7 @@ class OrderManager:
             # Remove from active working order IDs since it's now filled
             self._working_order_ids.discard(order_id)
             self._save_working_order_ids()
-            logging.info(f"{self.symbol}: Working sell order {order_id} filled and recorded")
+            self._info(f"{self.symbol}: Working sell order {order_id} filled and recorded")
         
         # LIFO consumption: mark buy orders as consumed based on sold amount
         # We consume from the newest orders first (LIFO)
@@ -929,7 +954,7 @@ class OrderManager:
             consumed_summary = ', '.join([f"{oid[:12]}...: {amt:.2f}" for oid, amt in consumed_orders[:3]])
             if len(consumed_orders) > 3:
                 consumed_summary += f" (+{len(consumed_orders) - 3} more)"
-            logging.info(f"{self.symbol}: LIFO consumed {order.amount:.4f} coins from buy orders (newest first): {consumed_summary}")
+            self._info(f"{self.symbol}: LIFO consumed {order.amount:.4f} coins from buy orders (newest first): {consumed_summary}")
         
         # Save updated data
         try:
@@ -944,7 +969,7 @@ class OrderManager:
             }
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=2)
-            logging.info(f"{self.symbol}: Tracked filled sell order {order_id} - "
+            self._info(f"{self.symbol}: Tracked filled sell order {order_id} - "
                         f"sold {order.amount:.8f} @ {order.rate:.4f} = ${order.amount * order.rate:.2f}")
             # Long-term performance ledger (signals / copy-trade reporting)
             if self._performance_tracker:
@@ -972,7 +997,7 @@ class OrderManager:
         current_date = datetime.now(timezone.utc).date()
         if self.last_reset_date != current_date:
             if self.last_reset_date is not None:
-                logging.info(f"{self.symbol}: New day detected - resetting daily realized profit "
+                self._info(f"{self.symbol}: New day detected - resetting daily realized profit "
                             f"(previous: ${self.daily_realized_profit:.2f})")
             self.daily_realized_profit = 0.0
             self.last_reset_date = current_date
@@ -1262,7 +1287,7 @@ class OrderManager:
                            f"below minimum (${self.skim_min_amount:.2f}), skipping skim")
             return
         
-        logging.info(f"{self.symbol}: Executing skim - ${skim_amount:.2f} from "
+        self._info(f"{self.symbol}: Executing skim - ${skim_amount:.2f} from "
                     f"${sell_profit:.2f} sell profit ({self.skim_profit_percentage*100:.1f}%)")
         
         purchases_for_notify = []
@@ -1287,7 +1312,7 @@ class OrderManager:
                 if result.get('status') == 'ok':
                     bought_amount = result.get('amount', 0)
                     total_paid = result.get('total', 0)
-                    logging.info(f"{self.symbol}: ✅ Skim buy executed - {bought_amount:.8f} {cointype} "
+                    self._info(f"{self.symbol}: ✅ Skim buy executed - {bought_amount:.8f} {cointype} "
                                f"@ ${total_paid:.2f} {self.market}")
                     purchases_for_notify.append({
                         'cointype': cointype,
@@ -1460,7 +1485,7 @@ class OrderManager:
         if completed:
             amount = float(completed.get('amount', order.amount))
             rate = float(completed.get('rate', order.rate))
-            logging.info(f"{self.symbol}: ✓ Order verified via API - {order.side} {amount:.8f} @ {rate:.4f}")
+            self._info(f"{self.symbol}: ✓ Order verified via API - {order.side} {amount:.8f} @ {rate:.4f}")
             return True
         logging.debug(f"{self.symbol}: Order not found in completed orders API - {order.side} {order.amount:.8f} @ {order.rate:.4f}")
         return False
@@ -1489,7 +1514,7 @@ class OrderManager:
         # Log discrepancy if significant (> 1%)
         if abs(difference_pct) > 1.0:
             if difference > 0:
-                logging.info(
+                self._info(
                     f"{self.symbol}: Balance reconciliation: {difference:.2f} coins missing ({difference_pct:.1f}%) - syncing..."
                 )
                 # Trigger sync for missing orders
@@ -1530,7 +1555,7 @@ class OrderManager:
                 market=self.market,
             )
             if added:
-                logging.info(
+                self._info(
                     f"{self.symbol}: Synced {added} sell fill(s) from dry-run order store into ledger"
                 )
         except Exception as e:
@@ -1579,7 +1604,7 @@ class OrderManager:
                 f"Attempting to sync from exchange fill history..."
             )
         elif should_sync_by_time:
-            logging.info(
+            self._info(
                 f"{self.symbol}: 🔍 Checking for orders newer than JSON last_updated ({json_last_updated.isoformat()})..."
             )
         
@@ -1663,7 +1688,7 @@ class OrderManager:
             synced_count = 0
             synced_amount = 0.0
             if not missing_orders:
-                logging.info(f"{self.symbol}: All buy orders are already in JSON")
+                self._info(f"{self.symbol}: All buy orders are already in JSON")
             else:
                 for order in missing_orders:
                     amount = float(order.get('amount', 0))
@@ -1792,7 +1817,7 @@ class OrderManager:
                         except Exception as e:
                             logging.debug(f"{self.symbol}: Performance tracker record_trade (synced buy) failed: {e}")
                 
-                    logging.info(
+                    self._info(
                         f"{self.symbol}: Synced missing order {order_id}: {amount:.8f} @ {rate:.4f} {self.market} "
                         f"(date: {solddate})"
                     )
@@ -1810,7 +1835,7 @@ class OrderManager:
                         )
                         self._notify_buy_fill_if_needed(stub, amount, rate)
                     else:
-                        logging.info(
+                        self._info(
                             f"{self.symbol}: Skipping Telegram for synced buy fill "
                             f"({amount:.8f} @ {rate:.4f}, date: {(solddate or '')[:19]}) — fill too old for sync notify"
                         )
@@ -1822,7 +1847,7 @@ class OrderManager:
                             break
             
             if synced_count > 0:
-                logging.info(
+                self._info(
                     f"{self.symbol}: Synced {synced_count} missing order(s) totaling {synced_amount:.8f} coins "
                     f"from exchange order history"
                 )
@@ -1838,7 +1863,7 @@ class OrderManager:
                     )
                 else:
                     # Log periodic syncs but don't send to Telegram
-                    logging.info(
+                    self._info(
                         f"{self.symbol}: {sync_type} - synced {synced_count} missing order(s), "
                         f"total: {synced_amount:.4f} coins (logged only, not sent to Telegram)"
                     )
@@ -1910,7 +1935,7 @@ class OrderManager:
                         sell_profit, sell_cost_basis = self._calculate_sell_profit(sell_order)
                         self._save_filled_sell_order(sell_order, solddate)
                         synced_sell_count += 1
-                        logging.info(
+                        self._info(
                             f"{self.symbol}: Synced missing SELL {order_id}: {amount:.8f} @ {rate:.4f} {self.market} (date: {solddate[:19]})"
                         )
                         if self.skim_enabled and sell_profit > 0:
@@ -1929,18 +1954,18 @@ class OrderManager:
                                 profit_usd=sell_profit,
                             )
                         else:
-                            logging.info(
+                            self._info(
                                 f"{self.symbol}: Skipping Telegram for synced sell fill "
                                 f"({amount:.8f} @ {rate:.4f}, date: {solddate[:19]}) — fill too old for sync notify"
                             )
                     if synced_sell_count:
-                        logging.info(
+                        self._info(
                             f"{self.symbol}: Synced {synced_sell_count} missing SELL(s) from order history (LIFO applied)"
                         )
         
         except Exception as e:
             logging.warning(f"{self.symbol}: Failed to sync missing fills from order history: {e}")
-            logging.info(f"{self.symbol}: Run sync_missing_orders.py manually to sync missing orders")
+            self._info(f"{self.symbol}: Run sync_missing_orders.py manually to sync missing orders")
     
     def _detect_duplicate_orders(self) -> List[Tuple[Dict, Dict]]:
         """
@@ -2075,12 +2100,12 @@ class OrderManager:
             # Remove the one with lower priority
             if priority1 > priority2:
                 orders_to_remove.add(order_id2)
-                logging.info(
+                self._info(
                     f"{self.symbol}: Removing duplicate order {order_id2} (keeping {order_id1})"
                 )
             elif priority2 > priority1:
                 orders_to_remove.add(order_id1)
-                logging.info(
+                self._info(
                     f"{self.symbol}: Removing duplicate order {order_id1} (keeping {order_id2})"
                 )
             else:
@@ -2088,12 +2113,12 @@ class OrderManager:
                 # Prefer keeping the one that appears first in the list
                 if order_id1 in [o.get('order_id') for o in stored_orders[:len(stored_orders)//2]]:
                     orders_to_remove.add(order_id2)
-                    logging.info(
+                    self._info(
                         f"{self.symbol}: Removing duplicate order {order_id2} (keeping {order_id1} - appeared first)"
                     )
                 else:
                     orders_to_remove.add(order_id1)
-                    logging.info(
+                    self._info(
                         f"{self.symbol}: Removing duplicate order {order_id1} (keeping {order_id2} - appeared first)"
                     )
         
@@ -2131,7 +2156,7 @@ class OrderManager:
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=2)
                 
-                logging.info(
+                self._info(
                     f"{self.symbol}: ✅ Removed {removed_count} duplicate order(s). "
                     f"Orders: {original_count} → {len(cleaned_orders)}"
                 )
@@ -2193,7 +2218,7 @@ class OrderManager:
         balance_diff_pct = abs(total_in_orders - current_coin_amount) / current_coin_amount * 100 if current_coin_amount > 0 else 0
         if current_coin_amount > 0 and balance_diff_pct < 2.0:  # Only if within 2% (very close match)
             # All orders match balance closely - use all of them
-            logging.info(f"{self.symbol}: Total matches balance within 2% ({balance_diff_pct:.2f}% diff) - using all {len(active_orders)} orders")
+            self._info(f"{self.symbol}: Total matches balance within 2% ({balance_diff_pct:.2f}% diff) - using all {len(active_orders)} orders")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=False)
             return active_orders
         
@@ -2202,7 +2227,7 @@ class OrderManager:
         
         if untracked_amount > 0:
             # More balance than orders - some coins not tracked, use all orders
-            logging.info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) > total orders ({total_in_orders:.8f}) by {untracked_amount:.8f} - using all {len(active_orders)} orders (some coins not tracked in JSON)")
+            self._info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) > total orders ({total_in_orders:.8f}) by {untracked_amount:.8f} - using all {len(active_orders)} orders (some coins not tracked in JSON)")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=False)
             return active_orders
         
@@ -2210,7 +2235,7 @@ class OrderManager:
         # The excess is from tracking gaps in old orders (consumed_amount already handles
         # LIFO consumption). Always keep NEWEST orders and trim the oldest excess.
         if total_in_orders > current_coin_amount:
-            logging.info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) < total orders ({total_in_orders:.8f}) "
+            self._info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) < total orders ({total_in_orders:.8f}) "
                         f"by {total_in_orders - current_coin_amount:.8f} ({balance_diff_pct:.1f}% excess) - "
                         f"keeping newest orders (consumed_amount already tracks LIFO)")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=True)  # NEWEST first
@@ -2282,7 +2307,7 @@ class OrderManager:
                 }
                 orders_to_use.append(synthetic_order)
                 accumulated_amount += missing
-                logging.info(
+                self._info(
                     f"{self.symbol}: Filled shortfall of {missing:.8f} coins ({missing_pct:.2f}%) using average price ${avg_price:.4f} "
                     f"(from {len(orders_to_use)-1} tracked orders). Total now: {accumulated_amount:.8f} coins."
                 )
@@ -2393,7 +2418,7 @@ class OrderManager:
                 }
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=2)
-                logging.info(f"{self.symbol}: Cleaned up JSON - removed all orders (no matching tokens in balance)")
+                self._info(f"{self.symbol}: Cleaned up JSON - removed all orders (no matching tokens in balance)")
             except Exception as e:
                 logging.error(f"{self.symbol}: Failed to cleanup JSON file: {e}")
             return
@@ -2433,7 +2458,7 @@ class OrderManager:
                 }
                 with open(file_path, 'w') as f:
                     json.dump(data, f, indent=2)
-                logging.info(
+                self._info(
                     f"{self.symbol}: Cleaned up JSON - removed {removed_count} order(s) that don't match current holdings. "
                     f"Now contains {len(orders_to_save)} order(s) for tokens we actually have."
                 )
@@ -2538,7 +2563,7 @@ class OrderManager:
         # Log significant changes in the rolling high for context
         if old_high > 0 and abs(self.rolling_price_high - old_high) / old_high > 0.01:
             window_days = self.price_elevation_window_hours / 24
-            logging.info(f"{self.symbol}: Rolling {window_days:.0f}-day high updated: "
+            self._info(f"{self.symbol}: Rolling {window_days:.0f}-day high updated: "
                        f"${old_high:.4f} -> ${self.rolling_price_high:.4f}")
         
         # Save to disk every 5 cycles (~5 minutes at 60s intervals)
@@ -2709,7 +2734,7 @@ class OrderManager:
                 # Calculate weighted average rate if multiple fills
                 if len(order_info['amounts']) > 1:
                     weighted_avg_rate = total_value / total_amount if total_amount > 0 else 0
-                    logging.info(f"{self.symbol}: Order {order_id[:20]}... has {len(order_info['amounts'])} partial fills - "
+                    self._info(f"{self.symbol}: Order {order_id[:20]}... has {len(order_info['amounts'])} partial fills - "
                                f"consolidating: {total_amount:.8f} XRP @ weighted avg ${weighted_avg_rate:.4f} "
                                f"(fills: {', '.join([f'{a:.2f}@{r:.4f}' for a, r in zip(order_info['amounts'], order_info['rates'])])})")
                     avg_rate = weighted_avg_rate
@@ -2770,7 +2795,7 @@ class OrderManager:
                 # Calculate weighted average rate if multiple fills
                 if len(order_info['amounts']) > 1:
                     weighted_avg_rate = total_value / total_amount if total_amount > 0 else 0
-                    logging.info(f"{self.symbol}: Sell order {order_id[:20]}... has {len(order_info['amounts'])} partial fills - "
+                    self._info(f"{self.symbol}: Sell order {order_id[:20]}... has {len(order_info['amounts'])} partial fills - "
                                f"consolidating: {total_amount:.8f} XRP @ weighted avg ${weighted_avg_rate:.4f} "
                                f"(fills: {', '.join([f'{a:.2f}@{r:.4f}' for a, r in zip(order_info['amounts'], order_info['rates'])])})")
                     avg_rate = weighted_avg_rate
@@ -2836,7 +2861,7 @@ class OrderManager:
         # ONLY use stored filled orders from JSON - this is the single source of truth
         stored_orders = self._get_stored_filled_orders()
         if stored_orders:
-            logging.info(f"{self.symbol}: Using {len(stored_orders)} stored filled buy orders for average entry calculation")
+            self._info(f"{self.symbol}: Using {len(stored_orders)} stored filled buy orders for average entry calculation")
             
             total_cost = 0.0
             total_amount = 0.0
@@ -2860,17 +2885,17 @@ class OrderManager:
                     original_amount = float(order.get('amount', 0))
                     consumed = float(order.get('consumed_amount', 0))
                     if consumed > 0:
-                        logging.info(f"{self.symbol}: Using stored buy order #{i}: {remaining:.8f} {self.cointype} @ {rate:.4f} {self.market} "
+                        self._info(f"{self.symbol}: Using stored buy order #{i}: {remaining:.8f} {self.cointype} @ {rate:.4f} {self.market} "
                                     f"(date: {formatted_date}, remaining of {original_amount:.8f}, {consumed:.8f} consumed, total: ${remaining * rate:.2f} {self.market})")
                     else:
-                        logging.info(f"{self.symbol}: Using stored buy order #{i}: {remaining:.8f} {self.cointype} @ {rate:.4f} {self.market} "
+                        self._info(f"{self.symbol}: Using stored buy order #{i}: {remaining:.8f} {self.cointype} @ {rate:.4f} {self.market} "
                                     f"(date: {formatted_date}, total: ${remaining * rate:.2f} {self.market})")
             
             if total_amount > 0:
                 self.total_coins = total_amount
                 self.total_invested = total_cost
                 self.average_entry_price = total_cost / total_amount
-                logging.info(f"{self.symbol}: Calculated average entry from stored orders: {self.average_entry_price:.4f} "
+                self._info(f"{self.symbol}: Calculated average entry from stored orders: {self.average_entry_price:.4f} "
                             f"(from {len(stored_orders)} buy orders, {total_amount:.8f} coins, ${total_cost:.2f} invested)")
                 
                 # NOTE: We do NOT cleanup the JSON file here anymore.
@@ -2993,11 +3018,11 @@ class OrderManager:
     def log_position_health(self):
         """Log position health indicator showing P&L and sell order profitability"""
         if self.coin_balance <= 0:
-            logging.info(f"{self.symbol}: No position - coin balance: {self.coin_balance:.8f}")
+            self._info(f"{self.symbol}: No position - coin balance: {self.coin_balance:.8f}")
             return
         
         if self.average_entry_price <= 0:
-            logging.info(f"{self.symbol}: Position health unavailable - no average entry price calculated")
+            self._info(f"{self.symbol}: Position health unavailable - no average entry price calculated")
             return
         
         # Use current_price for valuation (real-time price from API)
@@ -3007,7 +3032,7 @@ class OrderManager:
         valuation_price = self.current_price if self.current_price > 0 else (self.mid_price if self.mid_price > 0 else (self.bid_price if self.bid_price > 0 else self.last_price))
         
         if valuation_price <= 0:
-            logging.info(f"{self.symbol}: Position health unavailable - no valid price data")
+            self._info(f"{self.symbol}: Position health unavailable - no valid price data")
             return
         
         # Calculate position metrics using EXACT SAME method as daily summary
@@ -3049,13 +3074,13 @@ class OrderManager:
         # Log position health (summary only - order lists moved to respective ladder sections)
         # Note: Current price is already shown in Price Information section above
         # Cost basis calculated using same method as daily summary for consistency
-        logging.info(f"{self.symbol}: 📊 POSITION HEALTH")
-        logging.info(f"  Position: {self.coin_balance:.8f} {self.cointype}")
-        logging.info(f"  Average Entry: ${self.average_entry_price:.4f} {self.market}")
-        logging.info(f"  Total Invested: ${total_invested:.2f} {self.market}")
-        logging.info(f"  Current Value: ${current_value:.2f} {self.market} (at ${valuation_price:.4f} {self.market})")
-        logging.info(f"  Unrealized P&L: ${unrealized_pnl:+.2f} {self.market} ({unrealized_pnl_pct:+.2f}%)")
-        logging.info(f"  Status: {health_status}")
+        self._info(f"{self.symbol}: 📊 POSITION HEALTH")
+        self._info(f"  Position: {self.coin_balance:.8f} {self.cointype}")
+        self._info(f"  Average Entry: ${self.average_entry_price:.4f} {self.market}")
+        self._info(f"  Total Invested: ${total_invested:.2f} {self.market}")
+        self._info(f"  Current Value: ${current_value:.2f} {self.market} (at ${valuation_price:.4f} {self.market})")
+        self._info(f"  Unrealized P&L: ${unrealized_pnl:+.2f} {self.market} ({unrealized_pnl_pct:+.2f}%)")
+        self._info(f"  Status: {health_status}")
     
     def log_buy_orders_list(self):
         """Log detailed buy orders list (called from buy ladder section)"""
@@ -3066,7 +3091,7 @@ class OrderManager:
             highest_buy_price = sorted_buy_orders[0].rate if sorted_buy_orders else 0
             
             total_buy_committed = sum(o.amount * o.rate for o in buy_orders)
-            logging.info(f"{self.symbol}:   📉 BUY ORDERS ({len(buy_orders)} orders):")
+            self._info(f"{self.symbol}:   📉 BUY ORDERS ({len(buy_orders)} orders):")
             
             # Show execution requirement
             if self.ask_price > 0 and highest_buy_price > 0:
@@ -3074,10 +3099,10 @@ class OrderManager:
                 price_gap = self.ask_price - price_to_hit
                 price_gap_pct = (price_gap / self.ask_price * 100) if self.ask_price > 0 else 0
                 if price_gap > 0:
-                    logging.info(f"{self.symbol}:   💡 To execute highest buy: ask needs to reach ${price_to_hit:.4f} "
+                    self._info(f"{self.symbol}:   💡 To execute highest buy: ask needs to reach ${price_to_hit:.4f} "
                                f"(currently ${self.ask_price:.4f}, need -${price_gap:.4f} or -{price_gap_pct:.2f}%)")
                 else:
-                    logging.info(f"{self.symbol}:   Highest buy order at ${price_to_hit:.4f} - ask (${self.ask_price:.4f}) is below it!")
+                    self._info(f"{self.symbol}:   Highest buy order at ${price_to_hit:.4f} - ask (${self.ask_price:.4f}) is below it!")
             
             # List each buy order with details
             total_buy_value = 0.0
@@ -3092,11 +3117,11 @@ class OrderManager:
                 else:
                     discount_str = ""
                 
-                logging.info(f"{self.symbol}:     {order.amount:.8f} @ ${order.rate:.4f} = ${buy_value:.2f} ({discount_str})")
+                self._info(f"{self.symbol}:     {order.amount:.8f} @ ${order.rate:.4f} = ${buy_value:.2f} ({discount_str})")
             
-            logging.info(f"{self.symbol}:   Total Buy Orders Value: ${total_buy_value:.2f} {self.market}")
+            self._info(f"{self.symbol}:   Total Buy Orders Value: ${total_buy_value:.2f} {self.market}")
         else:
-            logging.info(f"{self.symbol}:   📉 BUY ORDERS: None placed")
+            self._info(f"{self.symbol}:   📉 BUY ORDERS: None placed")
     
     def log_sell_orders_list(self):
         """Log detailed sell orders list (called from sell ladder section)"""
@@ -3112,9 +3137,9 @@ class OrderManager:
             working_count = sum(1 for o in sell_orders if o.order_id in working_order_ids)
             
             if self.mean_reversion_enabled and working_count > 0:
-                logging.info(f"{self.symbol}:   📈 SELL ORDERS ({len(sell_orders)} orders: {core_count} Core, {working_count} Working):")
+                self._info(f"{self.symbol}:   📈 SELL ORDERS ({len(sell_orders)} orders: {core_count} Core, {working_count} Working):")
             else:
-                logging.info(f"{self.symbol}:   📈 SELL ORDERS ({len(sell_orders)} orders):")
+                self._info(f"{self.symbol}:   📈 SELL ORDERS ({len(sell_orders)} orders):")
             
             # Show execution requirement
             if self.bid_price > 0 and lowest_sell_price > 0:
@@ -3122,10 +3147,10 @@ class OrderManager:
                 price_gap = price_to_hit - self.bid_price
                 price_gap_pct = (price_gap / self.bid_price * 100) if self.bid_price > 0 else 0
                 if price_gap > 0:
-                    logging.info(f"{self.symbol}:   💡 To execute lowest sell: bid needs to reach ${price_to_hit:.4f} "
+                    self._info(f"{self.symbol}:   💡 To execute lowest sell: bid needs to reach ${price_to_hit:.4f} "
                                f"(currently ${self.bid_price:.4f}, need +${price_gap:.4f} or +{price_gap_pct:.2f}%)")
                 else:
-                    logging.info(f"{self.symbol}:   Lowest sell order at ${price_to_hit:.4f} - bid (${self.bid_price:.4f}) is above it!")
+                    self._info(f"{self.symbol}:   Lowest sell order at ${price_to_hit:.4f} - bid (${self.bid_price:.4f}) is above it!")
             
             total_sell_value = 0.0
             profitable_orders = 0
@@ -3206,26 +3231,26 @@ class OrderManager:
                     above_current_pct = ((order.rate - self.current_price) / self.current_price * 100)
                     above_current_str = f"+{above_current_pct:.2f}% above current"
                     matched_cost = (cost_basis / order.amount) if order.amount > 0 else 0.0
-                    logging.info(f"{self.symbol}:     {status_icon}{order_tag} {order.amount:.8f} @ ${order.rate:.4f} = ${sell_value:.2f} "
+                    self._info(f"{self.symbol}:     {status_icon}{order_tag} {order.amount:.8f} @ ${order.rate:.4f} = ${sell_value:.2f} "
                                f"({above_current_str}, LIFO cost: ${matched_cost:.4f}, profit: ${net_profit:+.2f}, {net_profit_pct:+.2f}% after fees)")
                 else:
-                    logging.info(f"{self.symbol}:     {status_icon}{order_tag} {order.amount:.8f} @ ${order.rate:.4f} = ${sell_value:.2f} "
+                    self._info(f"{self.symbol}:     {status_icon}{order_tag} {order.amount:.8f} @ ${order.rate:.4f} = ${sell_value:.2f} "
                                f"({above_entry_str}, profit: ${net_profit:+.2f}, {net_profit_pct:+.2f}% after fees)")
             
-            logging.info(f"{self.symbol}:   Total Sell Orders Value: ${total_sell_value:.2f} {self.market}")
+            self._info(f"{self.symbol}:   Total Sell Orders Value: ${total_sell_value:.2f} {self.market}")
             
             # Differentiated summary for Core vs Working
             if self.mean_reversion_enabled and working_count > 0:
-                logging.info(f"{self.symbol}:   Core Orders: {core_profitable_orders}/{core_count} profitable (recovery strategy)")
-                logging.info(f"{self.symbol}:   Working Orders: {working_count} active (mean-reversion; profit assumes lowest fill first)")
+                self._info(f"{self.symbol}:   Core Orders: {core_profitable_orders}/{core_count} profitable (recovery strategy)")
+                self._info(f"{self.symbol}:   Working Orders: {working_count} active (mean-reversion; profit assumes lowest fill first)")
             else:
-                logging.info(f"{self.symbol}:   Profitable Orders: {profitable_orders}/{len(sell_orders)}")
+                self._info(f"{self.symbol}:   Profitable Orders: {profitable_orders}/{len(sell_orders)}")
             
             # Only warn about unprofitable Core orders (Working below entry is expected)
             if unprofitable_orders > 0:
                 logging.warning(f"{self.symbol}:   ⚠️ {unprofitable_orders} Core sell order(s) may be unprofitable after fees")
         else:
-            logging.info(f"{self.symbol}:   📈 SELL ORDERS: None placed")
+            self._info(f"{self.symbol}:   📈 SELL ORDERS: None placed")
     
     def calculate_order_size(self, level_index: int, total_levels: int, total_amount: float, is_sell_order: bool = False, buy_level_pct: float = None) -> float:
         """Calculate order size for a ladder level
@@ -3320,7 +3345,7 @@ class OrderManager:
             change_from_placement = abs((self.current_price - self.price_when_orders_placed) / self.price_when_orders_placed) * 100
             if change_from_placement >= self.price_update_threshold:
                 direction = "↑" if self.current_price > self.price_when_orders_placed else "↓"
-                logging.info(f"{self.symbol}: Price {direction} {change_from_placement:.2f}% from when orders were placed "
+                self._info(f"{self.symbol}: Price {direction} {change_from_placement:.2f}% from when orders were placed "
                            f"(${self.price_when_orders_placed:.4f} → ${self.current_price:.4f}), threshold exceeded - updating buy ladder")
                 return True
         
@@ -3449,7 +3474,7 @@ class OrderManager:
         # Log price elevation status if enabled
         if self.price_elevation_enabled and self.rolling_price_high > 0:
             window_days = self.price_elevation_window_hours / 24
-            logging.info(f"{self.symbol}: Price Elevation Protection (mean-reversion):\n"
+            self._info(f"{self.symbol}: Price Elevation Protection (mean-reversion):\n"
                         f"  {window_days:.0f}-day range: ${self.rolling_price_low:.4f} - ${self.rolling_price_high:.4f} (mean ${self.rolling_price_mean:.4f})\n"
                         f"  current price: ${self.current_price:.4f}\n"
                         f"  percentile: {percentile:.1f}th (0=cheapest, 100=most expensive)\n"
@@ -3480,21 +3505,21 @@ class OrderManager:
             order_value = order.amount * order.rate
             if order_value < dust_threshold:
                 dust_orders.append(order)
-                logging.info(f"{self.symbol}: Detected dust buy order: {order.amount:.8f} @ ${order.rate:.4f} = ${order_value:.2f} "
+                self._info(f"{self.symbol}: Detected dust buy order: {order.amount:.8f} @ ${order.rate:.4f} = ${order_value:.2f} "
                            f"(below ${dust_threshold:.2f} threshold) - will cancel")
         
         # Cancel dust orders
         if dust_orders:
             for order in dust_orders:
                 try:
-                    logging.info(f"{self.symbol}: Cancelling dust buy order {order.order_id} at {order.rate:.4f} "
+                    self._info(f"{self.symbol}: Cancelling dust buy order {order.order_id} at {order.rate:.4f} "
                                f"(value: ${order.amount * order.rate:.2f})")
                     self.api.cancel_order(order.order_id, order_type="buy")
                     existing_buy_orders.remove(order)  # Remove from list to avoid processing it further
                 except Exception as e:
                     logging.warning(f"{self.symbol}: Failed to cancel dust order {order.order_id}: {e}")
             
-            logging.info(f"{self.symbol}: Cancelled {len(dust_orders)} dust order(s), waiting for cancellations to process...")
+            self._info(f"{self.symbol}: Cancelled {len(dust_orders)} dust order(s), waiting for cancellations to process...")
             time.sleep(0.5)
             # Re-fetch orders to get accurate state after cancellation
             try:
@@ -3520,7 +3545,7 @@ class OrderManager:
                         logging.warning(f"{self.symbol}: Found {len(phantom_orders)} phantom buy order(s) in tracking that don't exist in API:")
                         for order in phantom_orders:
                             logging.warning(f"{self.symbol}:   - Order {order.order_id} at ${order.rate:.4f} (amount: {order.amount:.8f})")
-                        logging.info(f"{self.symbol}: Removing phantom orders from tracking - they will be excluded from validation")
+                        self._info(f"{self.symbol}: Removing phantom orders from tracking - they will be excluded from validation")
                         # Remove phantom orders from existing_buy_orders
                         existing_buy_orders = [o for o in existing_buy_orders if o.order_id in api_order_ids]
             except Exception as e:
@@ -3533,7 +3558,7 @@ class OrderManager:
             # Only use levels from skip_levels onwards
             effective_levels = self.buy_levels[skip_levels:]
             needed_orders = min(self.max_buy_orders - skip_levels, len(effective_levels))
-            logging.info(f"{self.symbol}: Skipping {skip_levels} shallow buy levels (using levels {skip_levels+1}-{skip_levels+needed_orders} of {full_needed_orders})")
+            self._info(f"{self.symbol}: Skipping {skip_levels} shallow buy levels (using levels {skip_levels+1}-{skip_levels+needed_orders} of {full_needed_orders})")
         else:
             needed_orders = full_needed_orders
             effective_levels = self.buy_levels[:needed_orders]  # Always define effective_levels for consistency
@@ -3558,7 +3583,7 @@ class OrderManager:
             shallowest_level = self.buy_levels[0] if self.buy_levels else 1.0
             estimated_placement_price = highest_order_price / (1 - shallowest_level / 100)
             self.price_when_orders_placed = estimated_placement_price
-            logging.info(f"{self.symbol}: Estimated placement price at ${estimated_placement_price:.4f} "
+            self._info(f"{self.symbol}: Estimated placement price at ${estimated_placement_price:.4f} "
                         f"(from highest order ${highest_order_price:.4f} at {shallowest_level}% level)")
         
         if self.price_when_orders_placed > 0 and self.current_price > 0:
@@ -3569,7 +3594,7 @@ class OrderManager:
         else:
             price_status = f"  price: tracking from ${self.current_price:.4f}"
         
-        logging.info(f"{self.symbol}: Buy Ladder Check\n"
+        self._info(f"{self.symbol}: Buy Ladder Check\n"
                     f"  existing: {len(existing_buy_orders)}\n"
                     f"  needed: {needed_orders}\n"
                     f"  base_balance: {base_balance:.2f} {self.market} (total)\n"
@@ -3585,7 +3610,7 @@ class OrderManager:
         # If uncommitted_balance is negative, orders exceed the available allocation
         if uncommitted_balance < 0 and len(existing_buy_orders) > 0 and self.available_balance >= self.min_order_size:
             over_commit_pct = ((existing_buy_committed - self.available_balance) / self.available_balance) * 100
-            logging.info(f"{self.symbol}: Buy orders OVER-COMMITTED - "
+            self._info(f"{self.symbol}: Buy orders OVER-COMMITTED - "
                        f"committed ${existing_buy_committed:.2f} exceeds available ${self.available_balance:.2f} "
                        f"by {over_commit_pct:.1f}%. Cancelling all {len(existing_buy_orders)} orders to resize.")
             for order in existing_buy_orders:
@@ -3604,7 +3629,7 @@ class OrderManager:
         
         if self.available_balance < self.min_order_size:
             if len(existing_buy_orders) == 0:
-                logging.info(f"{self.symbol}: Insufficient balance for buy orders "
+                self._info(f"{self.symbol}: Insufficient balance for buy orders "
                            f"(available: {self.available_balance:.2f} {self.market}, "
                            f"minimum: {self.min_order_size:.2f} {self.market})")
             else:
@@ -3646,11 +3671,11 @@ class OrderManager:
                     if unused_pct > 10.0 and excess_above_expected > self.increased_capital_threshold:
                         # Significant excess capital (>10% unused) - resize immediately on startup
                         needs_resize = True
-                        logging.info(f"{self.symbol}: First run detected - {unused_pct:.1f}% of capital unused ({uncommitted_balance:.2f} {self.market}). "
+                        self._info(f"{self.symbol}: First run detected - {unused_pct:.1f}% of capital unused ({uncommitted_balance:.2f} {self.market}). "
                                    f"Resizing buy orders immediately to use available capital.")
                     elif excess_above_expected > self.increased_capital_threshold:
                         # Small excess above threshold - just log, let observation handle it
-                        logging.info(f"{self.symbol}: First run detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds expected buffer, "
+                        self._info(f"{self.symbol}: First run detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds expected buffer, "
                                    f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. "
                                    f"Keeping existing {len(existing_buy_orders)} orders (will resize after observation period).")
                     else:
@@ -3673,7 +3698,7 @@ class OrderManager:
                             self._increased_capital_detected_at = datetime.now()
                             unused_pct = (uncommitted_balance / self.available_balance) * 100
                             observation_period_minutes = self.increased_capital_observation_period / 60
-                            logging.info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
+                            self._info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
                                        f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
                         else:
                             # Observation already started - check countdown or trigger resize
@@ -3682,13 +3707,13 @@ class OrderManager:
                                 needs_resize = True
                                 unused_pct = (uncommitted_balance / self.available_balance) * 100
                                 observation_period_minutes = self.increased_capital_observation_period / 60
-                                logging.info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - resizing buy orders to use more capital.")
+                                self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - resizing buy orders to use more capital.")
                             else:
                                 remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
                                 remaining_minutes = int(remaining_seconds / 60)
                                 remaining_secs = int(remaining_seconds % 60)
                                 elapsed_minutes = int(elapsed_seconds / 60)
-                                logging.info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
+                                self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
                     else:
                         # Excess is just the normal buffer - don't start observation period
                         pass
@@ -3697,7 +3722,7 @@ class OrderManager:
                     self._increased_capital_detected_at = datetime.now()
                     unused_pct = (uncommitted_balance / self.available_balance) * 100
                     observation_period_minutes = self.increased_capital_observation_period / 60
-                    logging.info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
+                    self._info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
                                f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
                 else:
                     # Check if observation period has passed since increased capital was first detected
@@ -3708,14 +3733,14 @@ class OrderManager:
                         needs_resize = True
                         unused_pct = (uncommitted_balance / self.available_balance) * 100
                         observation_period_minutes = self.increased_capital_observation_period / 60
-                        logging.info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
+                        self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
                                    f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Resizing buy orders to use more capital.")
                     else:
                         remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
                         remaining_minutes = int(remaining_seconds / 60)
                         remaining_secs = int(remaining_seconds % 60)
                         elapsed_minutes = int(elapsed_seconds / 60)
-                        logging.info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
+                        self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
             else:
                 # No excess capital - reset the detection timestamp
                 if self._increased_capital_detected_at is not None:
@@ -3731,13 +3756,13 @@ class OrderManager:
                     if self._increased_capital_detected_at is None:
                         self._increased_capital_detected_at = datetime.now()
                         observation_period_minutes = self.increased_capital_observation_period / 60
-                        logging.info(f"{self.symbol}: Increased capital detected after buy orders filled - significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Starting {observation_period_minutes:.0f}-minute observation period.")
+                        self._info(f"{self.symbol}: Increased capital detected after buy orders filled - significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Starting {observation_period_minutes:.0f}-minute observation period.")
                     else:
                         elapsed_seconds = (datetime.now() - self._increased_capital_detected_at).total_seconds()
                         if elapsed_seconds >= self.increased_capital_observation_period:
                             needs_resize = True
                             observation_period_minutes = self.increased_capital_observation_period / 60
-                            logging.info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - buy orders filled, but significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Resizing.")
+                            self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - buy orders filled, but significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Resizing.")
             
             # Check if price moved significantly - if so, try to edit orders to new levels
             price_moved = self.should_update_orders()
@@ -3747,10 +3772,10 @@ class OrderManager:
                     # Check if this is a first-run resize (old_buy_committed == 0 means first run)
                     is_first_run_resize = old_buy_committed == 0
                     if is_first_run_resize:
-                        logging.info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), resizing to use all available capital (first run at startup)")
+                        self._info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), resizing to use all available capital (first run at startup)")
                     else:
                         observation_period_minutes = self.increased_capital_observation_period / 60
-                        logging.info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), resizing to use more capital (after {observation_period_minutes:.0f}-minute observation period)")
+                        self._info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), resizing to use more capital (after {observation_period_minutes:.0f}-minute observation period)")
                     # Reset the detection timestamp since we're now resizing
                     self._increased_capital_detected_at = None
                     # After first-run resize, temporarily disable excess capital detection for one cycle
@@ -3774,7 +3799,7 @@ class OrderManager:
                         existing_buy_orders = []
                     # Skip validation logic and fall through to place new orders
                 elif price_moved:
-                    logging.info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), price moved significantly - updating to maintain structure")
+                    self._info(f"{self.symbol}: Buy ladder complete ({len(existing_buy_orders)} orders), price moved significantly - updating to maintain structure")
                     self._update_buy_orders(existing_buy_orders)
                     # After updating, re-fetch orders to get accurate state
                     try:
@@ -3857,7 +3882,7 @@ class OrderManager:
                                         
                                         if is_percentage_undersized and is_dollar_significant:
                                             undersized_orders.append((order, level_idx, actual_amount, expected_amount))
-                                            logging.info(f"{self.symbol}: Buy order at level {level_idx} ({level_pct}%) is undersized: "
+                                            self._info(f"{self.symbol}: Buy order at level {level_idx} ({level_pct}%) is undersized: "
                                                        f"${actual_amount:.2f} vs expected ${expected_amount:.2f} ({actual_amount/expected_amount*100:.0f}%, diff: ${dollar_diff:.2f})")
                                         elif is_percentage_undersized and not is_dollar_significant:
                                             # Order is percentage-wise undersized but dollar difference is too small to matter
@@ -3867,7 +3892,7 @@ class OrderManager:
                             # Only cancel ALL orders if there are undersized orders that need rebalancing
                             if undersized_orders:
                                 # Cancel ALL orders - need full balance to redistribute properly
-                                logging.info(f"{self.symbol}: Cancelling ALL {len(valid_orders)} orders for full rebalance due to {len(undersized_orders)} undersized")
+                                self._info(f"{self.symbol}: Cancelling ALL {len(valid_orders)} orders for full rebalance due to {len(undersized_orders)} undersized")
                                 for order in valid_orders:
                                     orders_to_cancel.append(order)
                                 valid_orders = []
@@ -3876,7 +3901,7 @@ class OrderManager:
                     # Cancel orders that don't match the ladder or are undersized
                     for order in orders_to_cancel:
                         try:
-                            logging.info(f"{self.symbol}: Cancelling buy order {order.order_id} at {order.rate:.4f} "
+                            self._info(f"{self.symbol}: Cancelling buy order {order.order_id} at {order.rate:.4f} "
                                        f"(doesn't match ladder structure or is undersized)")
                             self.api.cancel_order(order.order_id, order_type="buy")
                         except Exception as e:
@@ -3948,13 +3973,13 @@ class OrderManager:
                         extra_orders = valid_orders[needed_orders:]
                         valid_orders = valid_orders[:needed_orders]
                         orders_to_cancel.extend(extra_orders)
-                        logging.info(f"{self.symbol}: Found {len(extra_orders)} extra buy orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
+                        self._info(f"{self.symbol}: Found {len(extra_orders)} extra buy orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
                     
                     # Cancel extra orders
                     if orders_to_cancel:
                         for order in orders_to_cancel:
                             try:
-                                logging.info(f"{self.symbol}: Cancelling extra buy order {order.order_id} at {order.rate:.4f} "
+                                self._info(f"{self.symbol}: Cancelling extra buy order {order.order_id} at {order.rate:.4f} "
                                            f"(have {len(existing_buy_orders)} orders, need {needed_orders})")
                                 self.api.cancel_order(order.order_id, order_type="buy")
                             except Exception as e:
@@ -3970,12 +3995,12 @@ class OrderManager:
                     # After cancelling extras, check if we still have enough orders
                     # If we have fewer than needed, fall through to place new orders
                     if len(existing_buy_orders) < needed_orders:
-                        logging.info(f"{self.symbol}: After cancelling extras, have {len(existing_buy_orders)} orders, need {needed_orders} - will place missing orders")
+                        self._info(f"{self.symbol}: After cancelling extras, have {len(existing_buy_orders)} orders, need {needed_orders} - will place missing orders")
                         # Fall through to order placement logic below (don't return)
                     else:
                         # We have enough orders (exactly needed_orders) - ladder is complete
                         # Note: Recalc info already shown in Buy Ladder Check above, no need to duplicate
-                        logging.info(f"{self.symbol}: Buy ladder stable ({len(existing_buy_orders)} orders)")
+                        self._info(f"{self.symbol}: Buy ladder stable ({len(existing_buy_orders)} orders)")
                         # Update tracking variable
                         self._last_buy_committed = existing_buy_committed
                         # Log buy orders list before returning
@@ -4025,9 +4050,9 @@ class OrderManager:
                     
                     if undersized_orders:
                         # Cancel ALL orders and rebuild - need full balance to redistribute properly
-                        logging.info(f"{self.symbol}: Found {len(undersized_orders)} undersized buy orders - cancelling ALL {len(existing_buy_orders)} orders for full rebalance")
+                        self._info(f"{self.symbol}: Found {len(undersized_orders)} undersized buy orders - cancelling ALL {len(existing_buy_orders)} orders for full rebalance")
                         for order, level_idx, level_pct, actual, expected in undersized_orders:
-                            logging.info(f"{self.symbol}: Undersized: level {level_idx} ({level_pct}%) has ${actual:.2f} vs expected ${expected:.2f} ({actual/expected*100:.0f}%)")
+                            self._info(f"{self.symbol}: Undersized: level {level_idx} ({level_pct}%) has ${actual:.2f} vs expected ${expected:.2f} ({actual/expected*100:.0f}%)")
                         # Cancel ALL orders to free up full balance for proper redistribution
                         for order in existing_buy_orders:
                             try:
@@ -4042,7 +4067,7 @@ class OrderManager:
                     elif len(existing_buy_orders) == needed_orders:
                         # Ladder is complete and stable - log status and return
                         # Note: Recalc info already shown in Buy Ladder Check above, no need to duplicate
-                        logging.info(f"{self.symbol}: Buy ladder stable ({len(existing_buy_orders)} orders)")
+                        self._info(f"{self.symbol}: Buy ladder stable ({len(existing_buy_orders)} orders)")
                         # Update tracking variable
                         self._last_buy_committed = existing_buy_committed
                         # Log buy orders list before returning
@@ -4085,7 +4110,7 @@ class OrderManager:
                     price_diff_pct = abs((order.rate - expected_price) / expected_price) * 100
                     if price_diff_pct < 0.5:
                         is_at_skipped_level = True
-                        logging.info(f"{self.symbol}: Order at {order.rate:.4f} is at skipped level ({level_pct}%) - will cancel due to price elevation")
+                        self._info(f"{self.symbol}: Order at {order.rate:.4f} is at skipped level ({level_pct}%) - will cancel due to price elevation")
                         break
             
             if is_at_skipped_level:
@@ -4125,12 +4150,12 @@ class OrderManager:
             extra_orders = valid_orders[needed_orders:]
             valid_orders = valid_orders[:needed_orders]
             orders_to_cancel.extend(extra_orders)
-            logging.info(f"{self.symbol}: Found {len(extra_orders)} extra buy orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
+            self._info(f"{self.symbol}: Found {len(extra_orders)} extra buy orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
         
         # Cancel orders that don't match the ladder or are duplicates/extras
         for order in orders_to_cancel:
             try:
-                logging.info(f"{self.symbol}: Cancelling buy order {order.order_id} at {order.rate:.4f} "
+                self._info(f"{self.symbol}: Cancelling buy order {order.order_id} at {order.rate:.4f} "
                            f"(doesn't match ladder structure or is duplicate/extra)")
                 self.api.cancel_order(order.order_id, order_type="buy")
             except Exception as e:
@@ -4169,7 +4194,7 @@ class OrderManager:
         if orders_to_place > 0 and needed_orders > 0:
             missing_pct = (orders_to_place / needed_orders) * 100
             if missing_pct > 20.0:  # More than 20% missing
-                logging.info(f"{self.symbol}: Missing {orders_to_place}/{needed_orders} orders ({missing_pct:.1f}%) - cancelling all {len(existing_buy_orders)} orders to recreate with full balance for proper sizing")
+                self._info(f"{self.symbol}: Missing {orders_to_place}/{needed_orders} orders ({missing_pct:.1f}%) - cancelling all {len(existing_buy_orders)} orders to recreate with full balance for proper sizing")
                 for order in existing_buy_orders:
                     try:
                         self.api.cancel_order(order.order_id, order_type="buy")
@@ -4183,13 +4208,13 @@ class OrderManager:
                 uncommitted_balance = self.available_balance
                 orders_to_place = needed_orders
         
-        logging.info(f"{self.symbol}: Placing buy ladder - available: {self.available_balance:.2f} {self.market}, "
+        self._info(f"{self.symbol}: Placing buy ladder - available: {self.available_balance:.2f} {self.market}, "
                     f"committed: {existing_buy_committed:.2f} {self.market}, uncommitted: {uncommitted_balance:.2f} {self.market}, "
                     f"existing: {len(existing_buy_orders)}, needed: {needed_orders}")
         
         # Check if we have enough uncommitted balance
         if uncommitted_balance < self.min_order_size:
-            logging.info(f"{self.symbol}: Insufficient uncommitted balance for new buy orders "
+            self._info(f"{self.symbol}: Insufficient uncommitted balance for new buy orders "
                         f"(uncommitted: {uncommitted_balance:.2f} {self.market}, minimum: {self.min_order_size:.2f} {self.market})")
             self.log_buy_orders_list()
             return
@@ -4217,7 +4242,7 @@ class OrderManager:
         if self.price_elevation_enabled and allocation_pct < 100:
             total_buy_amount = base_buy_amount * (allocation_pct / 100)
             reserved_amount = base_buy_amount - total_buy_amount
-            logging.info(f"{self.symbol}: Price Elevation: Using {allocation_pct}% of balance "
+            self._info(f"{self.symbol}: Price Elevation: Using {allocation_pct}% of balance "
                         f"(${total_buy_amount:.2f}), reserving ${reserved_amount:.2f} for lower prices")
         else:
             total_buy_amount = base_buy_amount
@@ -4233,7 +4258,7 @@ class OrderManager:
             # Calculate if a single order would be above minimum
             single_order_amount = total_buy_amount / orders_to_place if orders_to_place > 0 else 0
             if single_order_amount < self.min_order_size:
-                logging.info(f"{self.symbol}: Cannot place buy orders - uncommitted balance ({uncommitted_balance:.2f} {self.market}) "
+                self._info(f"{self.symbol}: Cannot place buy orders - uncommitted balance ({uncommitted_balance:.2f} {self.market}) "
                            f"too small to place even one order above minimum ({self.min_order_size:.2f} {self.market}). "
                            f"Would need {self.min_order_size * orders_to_place:.2f} {self.market} for {orders_to_place} orders.")
                 self.log_buy_orders_list()
@@ -4252,7 +4277,7 @@ class OrderManager:
                 min_acceptable_order_size = self.min_order_size
                 
                 if smallest_expected_order < min_acceptable_order_size:
-                    logging.info(f"{self.symbol}: Insufficient balance for properly-sized orders - "
+                    self._info(f"{self.symbol}: Insufficient balance for properly-sized orders - "
                                f"smallest order would be ${smallest_expected_order:.2f} (need ${min_acceptable_order_size:.2f} minimum). "
                                f"Total available: ${total_buy_amount:.2f}, needed orders: {needed_orders}. "
                                f"Skipping order placement to avoid undersized orders that would trigger rebalance.")
@@ -4266,7 +4291,7 @@ class OrderManager:
         if len(existing_buy_orders) == 0:
             # Simple case: place all orders from scratch
             level_indices_to_fill = list(range(needed_orders))
-            logging.info(f"{self.symbol}: Placing all {needed_orders} orders from scratch at levels: {[effective_levels[i] for i in level_indices_to_fill]}%")
+            self._info(f"{self.symbol}: Placing all {needed_orders} orders from scratch at levels: {[effective_levels[i] for i in level_indices_to_fill]}%")
         else:
             # Map existing orders to their level indices (within effective_levels)
             # For deep levels (15%+), also check if price moved up - if so, keep existing orders at old prices
@@ -4302,21 +4327,21 @@ class OrderManager:
                     missing_level_pct = effective_levels[first_missing_index]
                     # EXCEPTION: Always allow gap-filling for shallow levels (0.5%, 1.0%) since they're frequent and recover quickly
                     if missing_level_pct <= 1.0:
-                        logging.info(f"{self.symbol}: Allowing gap-filling for shallow level {missing_level_pct}% "
+                        self._info(f"{self.symbol}: Allowing gap-filling for shallow level {missing_level_pct}% "
                                    f"(frequent drops, immediate replacement needed)")
                         should_skip_single_gap = False  # Don't skip shallow levels
                     else:
-                        logging.info(f"{self.symbol}: Skip gap-filling - only 1 order missing at {missing_level_pct}% level "
+                        self._info(f"{self.symbol}: Skip gap-filling - only 1 order missing at {missing_level_pct}% level "
                                    f"and price hasn't moved significantly (allows multiple orders to fill before rebalancing)")
                         self.log_buy_orders_list()
                         return
                 else:
-                    logging.info(f"{self.symbol}: Skip gap-filling - only 1 order missing and price hasn't moved significantly "
+                    self._info(f"{self.symbol}: Skip gap-filling - only 1 order missing and price hasn't moved significantly "
                                f"(allows multiple orders to fill before rebalancing)")
                     self.log_buy_orders_list()
                     return
             elif should_skip_single_gap:
-                logging.info(f"{self.symbol}: Skip gap-filling - only 1 order missing and price hasn't moved significantly "
+                self._info(f"{self.symbol}: Skip gap-filling - only 1 order missing and price hasn't moved significantly "
                            f"(allows multiple orders to fill before rebalancing)")
                 self.log_buy_orders_list()
                 return
@@ -4324,18 +4349,18 @@ class OrderManager:
             # If we have gaps, fill those first; otherwise fill from the end
             if missing_level_indices:
                 level_indices_to_fill = missing_level_indices[:orders_to_place]
-                logging.info(f"{self.symbol}: Filling gaps at levels: {[effective_levels[i] for i in level_indices_to_fill]}%")
+                self._info(f"{self.symbol}: Filling gaps at levels: {[effective_levels[i] for i in level_indices_to_fill]}%")
             else:
                 # No gaps detected, fill from the end (fallback)
                 level_indices_to_fill = list(range(len(existing_buy_orders), len(existing_buy_orders) + orders_to_place))
-                logging.info(f"{self.symbol}: No gaps detected, filling from end at levels: {[effective_levels[i] if i < len(effective_levels) else 'N/A' for i in level_indices_to_fill]}%")
+                self._info(f"{self.symbol}: No gaps detected, filling from end at levels: {[effective_levels[i] if i < len(effective_levels) else 'N/A' for i in level_indices_to_fill]}%")
         
         if needed_orders <= 0:
             logging.warning(f"{self.symbol}: Cannot place buy orders - needed_orders is {needed_orders}")
             return
         amount_per_order = total_buy_amount / needed_orders
         
-        logging.info(f"{self.symbol}: Attempting to place {orders_to_place} buy orders, "
+        self._info(f"{self.symbol}: Attempting to place {orders_to_place} buy orders, "
                     f"total_buy_amount: {total_buy_amount:.2f} {self.market}, "
                     f"amount_per_order: {amount_per_order:.2f} {self.market}")
         
@@ -4370,7 +4395,7 @@ class OrderManager:
                 # Require full discount percentage when filling gaps (not just 80%)
                 # This ensures replacement orders have proper spacing from current ask price
                 if discount_from_ask < buy_level_pct:
-                    logging.info(f"{self.symbol}: Skipping placement at {buy_level_pct}% level - buy price ${buy_price:.4f} is only {discount_from_ask:.2f}% below ask ${price_to_check:.4f} "
+                    self._info(f"{self.symbol}: Skipping placement at {buy_level_pct}% level - buy price ${buy_price:.4f} is only {discount_from_ask:.2f}% below ask ${price_to_check:.4f} "
                                 f"(need full {buy_level_pct:.1f}% discount when filling gaps to avoid immediate fill)")
                     continue
             
@@ -4423,7 +4448,7 @@ class OrderManager:
                 # API expects coin amount, not quote notional (per API docs)
                 coin_amount = order_size / buy_price
                 
-                logging.info(f"{self.symbol}: Placing buy order {i+1}/{orders_to_place}: "
+                self._info(f"{self.symbol}: Placing buy order {i+1}/{orders_to_place}: "
                            f"{coin_amount:.8f} {self.cointype} at {buy_price:.4f} {self.market} "
                            f"(spending {order_size:.2f} {self.market})")
                 
@@ -4436,7 +4461,7 @@ class OrderManager:
                 
                 if response.get('status') == 'ok':
                     order_id = response.get('id', 'unknown')
-                    logging.info(f"{self.symbol}: Placed buy order {i+1}/{orders_to_place} at {buy_price:.2f} "
+                    self._info(f"{self.symbol}: Placed buy order {i+1}/{orders_to_place} at {buy_price:.2f} "
                                f"({buy_level_pct}% below price), size: {order_size:.2f} {self.market}, order ID: {order_id}")
                     # Track order ID for fill detection
                     if not hasattr(self, 'previous_order_ids'):
@@ -4486,7 +4511,7 @@ class OrderManager:
         # triggers the excessive new funds detection
         if api_error_occurred:
             if self._increased_capital_detected_at is not None:
-                logging.info(f"{self.symbol}: API errors occurred during order placement - resetting excessive new funds detection "
+                self._info(f"{self.symbol}: API errors occurred during order placement - resetting excessive new funds detection "
                            f"to avoid false positive trigger from incomplete ladder.")
                 self._increased_capital_detected_at = None
         
@@ -4539,7 +4564,7 @@ class OrderManager:
         # Require at least enough for meaningful sell orders (e.g., 10+ coins or 5% of a reasonable position)
         min_meaningful_balance = 10.0  # Skip sell orders if balance is less than this
         if coin_amount < min_meaningful_balance:
-            logging.info(f"{self.symbol}: Coin balance too small ({coin_amount:.8f}) for sell orders "
+            self._info(f"{self.symbol}: Coin balance too small ({coin_amount:.8f}) for sell orders "
                         f"(minimum: {min_meaningful_balance}). "
                         f"Skipping sell orders - focus on building position with buy orders first.")
             return
@@ -4550,14 +4575,14 @@ class OrderManager:
             self.working_coins = coin_amount * self.working_position_pct
             self.core_coins = coin_amount - self.working_coins
             
-            logging.info(f"{self.symbol}: Mean-reversion mode: Core={self.core_coins:.8f} ({100*(1-self.working_position_pct):.1f}%), "
+            self._info(f"{self.symbol}: Mean-reversion mode: Core={self.core_coins:.8f} ({100*(1-self.working_position_pct):.1f}%), "
                         f"Working={self.working_coins:.8f} ({100*self.working_position_pct:.1f}%)")
             
             # Place Core ladder (recovery strategy - relative to avg_entry)
             if self.core_coins >= min_meaningful_balance:
                 self._place_core_sell_ladder(avg_entry, self.core_coins)
             else:
-                logging.info(f"{self.symbol}: Core position too small ({self.core_coins:.8f}), skipping Core ladder")
+                self._info(f"{self.symbol}: Core position too small ({self.core_coins:.8f}), skipping Core ladder")
             
             # Place Working ladder (mean-reversion strategy - relative to current_price)
             # CRITICAL: Only place Working orders when price is BELOW average entry
@@ -4577,14 +4602,14 @@ class OrderManager:
                 if not self.working_ladder_enabled:
                     logging.debug(f"{self.symbol}: Working ladder disabled in config")
                 elif self.working_coins < min_working:
-                    logging.info(
+                    self._info(
                         f"{self.symbol}: Working slice too small ({self.working_coins:.8f} "
                         f"< {min_working:.8f} min for ${self.min_order_size:.2f} orders), skipping Working ladder"
                     )
                 elif self.current_price <= 0:
                     logging.warning(f"{self.symbol}: Cannot place Working ladder - no current price available")
                 elif not price_below_entry:
-                    logging.info(f"{self.symbol}: Price (${self.current_price:.4f}) >= avg entry (${avg_entry:.4f}) - "
+                    self._info(f"{self.symbol}: Price (${self.current_price:.4f}) >= avg entry (${avg_entry:.4f}) - "
                                f"disabling Working ladder (Core handles selling when profitable)")
         else:
             # Recovery mode: All position is Core (existing behavior)
@@ -4651,21 +4676,21 @@ class OrderManager:
             order_value = order.amount * order.rate
             if order_value < dust_threshold:
                 dust_orders.append(order)
-                logging.info(f"{self.symbol}: Detected dust sell order: {order.amount:.8f} @ ${order.rate:.4f} = ${order_value:.2f} "
+                self._info(f"{self.symbol}: Detected dust sell order: {order.amount:.8f} @ ${order.rate:.4f} = ${order_value:.2f} "
                            f"(below ${dust_threshold:.2f} threshold) - will cancel")
         
         # Cancel dust orders
         if dust_orders:
             for order in dust_orders:
                 try:
-                    logging.info(f"{self.symbol}: Cancelling dust sell order {order.order_id} at {order.rate:.4f} "
+                    self._info(f"{self.symbol}: Cancelling dust sell order {order.order_id} at {order.rate:.4f} "
                                f"(value: ${order.amount * order.rate:.2f})")
                     self.api.cancel_order(order.order_id, order_type="sell")
                     existing_sell_orders.remove(order)  # Remove from list to avoid processing it further
                 except Exception as e:
                     logging.warning(f"{self.symbol}: Failed to cancel dust sell order {order.order_id}: {e}")
             
-            logging.info(f"{self.symbol}: Cancelled {len(dust_orders)} dust sell order(s), waiting for cancellations to process...")
+            self._info(f"{self.symbol}: Cancelled {len(dust_orders)} dust sell order(s), waiting for cancellations to process...")
             time.sleep(0.5)
             # Re-fetch orders to get accurate state after cancellation
             try:
@@ -4711,13 +4736,13 @@ class OrderManager:
             extra_orders = valid_orders[needed_orders:]
             valid_orders = valid_orders[:needed_orders]
             orders_to_cancel.extend(extra_orders)
-            logging.info(f"{self.symbol}: Found {len(extra_orders)} extra sell orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
+            self._info(f"{self.symbol}: Found {len(extra_orders)} extra sell orders (have {len(valid_orders) + len(extra_orders)}, need {needed_orders}) - cancelling extras")
         
         # Cancel sell orders that don't match the ladder or are extra
         cancelled_count = 0
         for order in orders_to_cancel:
             try:
-                logging.info(f"{self.symbol}: Cancelling sell order {order.order_id} at {order.rate:.4f} "
+                self._info(f"{self.symbol}: Cancelling sell order {order.order_id} at {order.rate:.4f} "
                            f"(doesn't match ladder structure or is extra)")
                 result = self.api.cancel_order(order.order_id, order_type="sell")
                 if result.get('status') == 'ok':
@@ -4746,7 +4771,7 @@ class OrderManager:
         available_coins = core_coins - existing_sell_amount
         
         # Log comprehensive sell ladder check (standardized with buy ladder format)
-        logging.info(f"{self.symbol}: Core Sell Ladder Check\n"
+        self._info(f"{self.symbol}: Core Sell Ladder Check\n"
                     f"  existing: {len(existing_sell_orders)}\n"
                     f"  max_orders: {needed_orders}\n"
                     f"  avg_entry: {avg_entry:.4f}\n"
@@ -4827,14 +4852,14 @@ class OrderManager:
             
             if old_avg_entry > 0 and abs(avg_entry - old_avg_entry) / old_avg_entry > 0.01:  # 1% change
                 avg_entry_changed = True
-                logging.info(f"{self.symbol}: Average entry changed ({old_avg_entry:.4f} -> {avg_entry:.4f}), updating sell ladder")
+                self._info(f"{self.symbol}: Average entry changed ({old_avg_entry:.4f} -> {avg_entry:.4f}), updating sell ladder")
             
             # Check if balance increased significantly
             old_core_coins = getattr(self, '_last_core_coins', core_coins)
             if old_core_coins > 0 and core_coins > old_core_coins * 1.05:  # Core balance increased by >5%
                 balance_increased = True
                 increase_pct = ((core_coins - old_core_coins) / old_core_coins) * 100
-                logging.info(f"{self.symbol}: Core balance increased by {increase_pct:.1f}% ({old_core_coins:.8f} -> {core_coins:.8f}), updating Core ladder")
+                self._info(f"{self.symbol}: Core balance increased by {increase_pct:.1f}% ({old_core_coins:.8f} -> {core_coins:.8f}), updating Core ladder")
             
             # Check for over-commitment: Core orders using more coins than Core allocation allows
             # This can happen if working_position_pct was changed in config between restarts
@@ -4842,7 +4867,7 @@ class OrderManager:
             # Must check BEFORE the normal rebalance logic, as available_coins will be negative
             if available_coins < 0 and existing_sell_amount > 0 and old_core_coins > 0:
                 over_commit_pct = ((existing_sell_amount - core_coins) / core_coins) * 100
-                logging.info(f"{self.symbol}: Core sell orders OVER-COMMITTED - "
+                self._info(f"{self.symbol}: Core sell orders OVER-COMMITTED - "
                            f"committed {existing_sell_amount:.8f} exceeds Core allocation {core_coins:.8f} "
                            f"by {over_commit_pct:.1f}%. Resizing to release coins for Working orders.")
                 needs_resize = True
@@ -4855,7 +4880,7 @@ class OrderManager:
                 if old_core_coins > 0 and core_coins > old_core_coins:
                     needs_resize = True
                     unused_pct = (available_coins / core_coins) * 100 if core_coins > 0 else 0
-                    logging.info(f"{self.symbol}: Available Core coins ({available_coins:.8f}) significantly exceed committed ({existing_sell_amount:.8f}), "
+                    self._info(f"{self.symbol}: Available Core coins ({available_coins:.8f}) significantly exceed committed ({existing_sell_amount:.8f}), "
                                f"{unused_pct:.1f}% unused. Updating Core ladder to use full balance.")
                 elif old_core_coins > 0:
                     # Balance decreased or unchanged (sell filled) - don't resize, keep existing orders
@@ -4876,7 +4901,7 @@ class OrderManager:
                 # If available_coins is negative, Core is definitively over-committed
                 if available_coins < 0 and existing_sell_amount > 0:
                     over_commit_pct = ((existing_sell_amount - core_coins) / core_coins) * 100
-                    logging.info(f"{self.symbol}: Core sell orders OVER-COMMITTED on startup - "
+                    self._info(f"{self.symbol}: Core sell orders OVER-COMMITTED on startup - "
                                f"committed {existing_sell_amount:.8f} exceeds Core allocation {core_coins:.8f} "
                                f"by {over_commit_pct:.1f}%. Resizing to release coins for Working orders.")
                     self._resize_sell_orders(existing_sell_orders, core_coins, avg_entry)
@@ -4885,11 +4910,11 @@ class OrderManager:
                     return
                 elif available_coins > existing_sell_amount * self.sell_ladder_rebalance_threshold:
                     unused_pct = (available_coins / core_coins) * 100 if core_coins > 0 else 0
-                    logging.info(f"{self.symbol}: First Core sell ladder check - {core_coins:.8f} coins, "
+                    self._info(f"{self.symbol}: First Core sell ladder check - {core_coins:.8f} coins, "
                                f"{available_coins:.8f} uncommitted ({unused_pct:.1f}%). "
                                f"Keeping existing {len(existing_sell_orders)} orders (restart detected, not resizing).")
                 else:
-                    logging.info(f"{self.symbol}: First Core sell ladder check - {core_coins:.8f} coins, "
+                    self._info(f"{self.symbol}: First Core sell ladder check - {core_coins:.8f} coins, "
                                f"all committed to {len(existing_sell_orders)} orders. Keeping existing orders.")
                 # Only update prices if avg_entry changed, don't resize
                 if avg_entry_changed:
@@ -4902,13 +4927,13 @@ class OrderManager:
                 if needs_resize and avg_entry_changed:
                     # Both conditions: need to resize amounts AND update prices
                     # Cancel and recreate with NEW prices (based on new avg_entry) and new amounts
-                    logging.info(f"{self.symbol}: Resizing and updating Core sell orders - avg_entry changed ({old_avg_entry:.4f} -> {avg_entry:.4f}), "
+                    self._info(f"{self.symbol}: Resizing and updating Core sell orders - avg_entry changed ({old_avg_entry:.4f} -> {avg_entry:.4f}), "
                                f"cancelling {len(existing_sell_orders)} orders to use full Core balance with updated prices")
                     self._resize_and_update_sell_orders(existing_sell_orders, core_coins, avg_entry)
                     # Return immediately after resizing - tracking variables will be set below
                 elif needs_resize:
                     # Only resizing needed: preserve prices, update amounts
-                    logging.info(f"{self.symbol}: Resizing Core sell orders - cancelling {len(existing_sell_orders)} orders to use full Core balance (preserving prices)")
+                    self._info(f"{self.symbol}: Resizing Core sell orders - cancelling {len(existing_sell_orders)} orders to use full Core balance (preserving prices)")
                     self._resize_sell_orders(existing_sell_orders, core_coins, avg_entry)
                     # Return immediately after resizing - tracking variables will be set below
                 else:
@@ -4922,7 +4947,7 @@ class OrderManager:
         
         # If we cancelled orders, wait and re-fetch to get accurate state
         if orders_to_cancel:
-            logging.info(f"{self.symbol}: Cancelled {len(orders_to_cancel)} sell orders, waiting for cancellations to process...")
+            self._info(f"{self.symbol}: Cancelled {len(orders_to_cancel)} sell orders, waiting for cancellations to process...")
             time.sleep(1.5)  # Give time for cancellations to complete
             
             # Re-fetch orders to get accurate current state
@@ -4931,13 +4956,13 @@ class OrderManager:
                 if orders_data:
                     self.update_open_orders(orders_data)
                     existing_sell_orders = self.get_sell_orders()
-                    logging.info(f"{self.symbol}: After cancellation, found {len(existing_sell_orders)} remaining sell orders")
+                    self._info(f"{self.symbol}: After cancellation, found {len(existing_sell_orders)} remaining sell orders")
             except Exception as e:
                 logging.warning(f"{self.symbol}: Could not re-fetch orders after cancellation: {e}")
         
         # Re-check if we have enough orders after cancellation
         if len(existing_sell_orders) >= needed_orders:
-            logging.info(f"{self.symbol}: Sell ladder complete after cancellation ({len(existing_sell_orders)} orders)")
+            self._info(f"{self.symbol}: Sell ladder complete after cancellation ({len(existing_sell_orders)} orders)")
             return
         
         # Check for CRITICAL gap in ladder coverage
@@ -4960,10 +4985,10 @@ class OrderManager:
         if ladder_has_gaps:
             missing_count = placeable_levels - len(existing_sell_orders)
             coverage_pct = (len(existing_sell_orders) / placeable_levels) * 100 if placeable_levels > 0 else 100
-            logging.info(f"{self.symbol}: ⚠️ LADDER GAP DETECTED - Only {len(existing_sell_orders)}/{placeable_levels} placeable orders ({coverage_pct:.0f}% coverage). "
+            self._info(f"{self.symbol}: ⚠️ LADDER GAP DETECTED - Only {len(existing_sell_orders)}/{placeable_levels} placeable orders ({coverage_pct:.0f}% coverage). "
                        f"Missing {missing_count} orders means missing profit opportunities on rebounds! "
                        f"(Note: {needed_orders - placeable_levels} levels skipped - price is above those sell prices)")
-            logging.info(f"{self.symbol}: Rebuilding sell ladder to fill gaps and restore full coverage.")
+            self._info(f"{self.symbol}: Rebuilding sell ladder to fill gaps and restore full coverage.")
             
             # Cancel existing orders and rebuild with proper levels
             for order in existing_sell_orders:
@@ -4992,7 +5017,7 @@ class OrderManager:
                 if core_coins > old_core_coins * 1.05:  # Core balance increased by >5%
                     balance_increased = True
                     increase_pct = ((core_coins - old_core_coins) / old_core_coins) * 100
-                    logging.info(f"{self.symbol}: Core balance increased by {increase_pct:.1f}% ({old_core_coins:.8f} -> {core_coins:.8f}), "
+                    self._info(f"{self.symbol}: Core balance increased by {increase_pct:.1f}% ({old_core_coins:.8f} -> {core_coins:.8f}), "
                                f"will add new Core sell orders to use additional coins")
                 elif core_coins <= old_core_coins:
                     # Balance decreased or stayed same (sell order filled, no new buys)
@@ -5020,7 +5045,7 @@ class OrderManager:
                         # There are placeable levels without orders - need to redistribute!
                         # Option B: Don't redistribute if a sell just filled this cycle
                         if getattr(self, '_sell_filled_this_cycle', False):
-                            logging.info(f"{self.symbol}: Price dropped - {len(newly_placeable_levels)} new level(s) now placeable, "
+                            self._info(f"{self.symbol}: Price dropped - {len(newly_placeable_levels)} new level(s) now placeable, "
                                        f"but sell filled this cycle - deferring redistribution to next cycle.")
                             self._last_avg_entry = avg_entry
                             self._last_core_coins = core_coins
@@ -5028,7 +5053,7 @@ class OrderManager:
                         
                         # Since all coins are committed to existing orders, we need to RESIZE
                         # to include the new levels in the distribution
-                        logging.info(f"{self.symbol}: Price dropped - {len(newly_placeable_levels)} new level(s) now placeable. "
+                        self._info(f"{self.symbol}: Price dropped - {len(newly_placeable_levels)} new level(s) now placeable. "
                                    f"Resizing all orders to redistribute across {len(existing_sell_orders) + len(newly_placeable_levels)} levels.")
                         
                         # Cancel existing orders and rebuild with all placeable levels
@@ -5080,7 +5105,7 @@ class OrderManager:
                                 
                                 if response.get('status') == 'ok':
                                     order_id = response.get('id', 'unknown')
-                                    logging.info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
+                                    self._info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
                                                f"({level_pct}% above entry), size: {rounded_amount:.8f}")
                                     placed_amount += rounded_amount
                                     # Track order ID for fill detection
@@ -5104,13 +5129,13 @@ class OrderManager:
                             # Option B: Don't resize if a sell just filled this cycle
                             # This preserves higher-level order sizes instead of diluting them
                             if getattr(self, '_sell_filled_this_cycle', False):
-                                logging.info(f"{self.symbol}: Significant uncommitted Core balance detected ({available_coins:.4f} coins, "
+                                self._info(f"{self.symbol}: Significant uncommitted Core balance detected ({available_coins:.4f} coins, "
                                            f"{uncommitted_pct:.1f}%) but sell filled this cycle - NOT resizing to preserve order sizes.")
                                 self._last_avg_entry = avg_entry
                                 self._last_core_coins = core_coins
                                 return
                             
-                            logging.info(f"{self.symbol}: Significant uncommitted Core balance detected ({available_coins:.4f} coins, "
+                            self._info(f"{self.symbol}: Significant uncommitted Core balance detected ({available_coins:.4f} coins, "
                                        f"{uncommitted_pct:.1f}%). Resizing all Core orders to use full balance.")
                             
                             # Cancel existing orders and rebuild with proper distribution
@@ -5163,7 +5188,7 @@ class OrderManager:
                                     
                                     if response.get('status') == 'ok':
                                         order_id = response.get('id', 'unknown')
-                                        logging.info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
+                                        self._info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
                                                    f"({level_pct}% above entry), size: {rounded_amount:.8f}")
                                         placed_amount += rounded_amount
                                         if not hasattr(self, 'previous_order_ids'):
@@ -5191,7 +5216,7 @@ class OrderManager:
                 # If available_coins is negative, Core is definitively over-committed
                 if available_coins < 0 and existing_sell_amount > 0:
                     over_commit_pct = ((existing_sell_amount - core_coins) / core_coins) * 100
-                    logging.info(f"{self.symbol}: Core sell orders OVER-COMMITTED (restart path) - "
+                    self._info(f"{self.symbol}: Core sell orders OVER-COMMITTED (restart path) - "
                                f"committed {existing_sell_amount:.8f} exceeds Core allocation {core_coins:.8f} "
                                f"by {over_commit_pct:.1f}%. Resizing to release coins for Working orders.")
                     self._resize_sell_orders(existing_sell_orders, core_coins, avg_entry)
@@ -5202,7 +5227,7 @@ class OrderManager:
                 # If all coins are already committed, keep existing orders (they were placed before restart)
                 elif available_coins > existing_sell_amount * self.sell_ladder_rebalance_threshold:
                     balance_increased = True
-                    logging.info(f"{self.symbol}: First Core sell ladder check or restart - {core_coins:.8f} coins, "
+                    self._info(f"{self.symbol}: First Core sell ladder check or restart - {core_coins:.8f} coins, "
                                f"{available_coins:.8f} uncommitted. Will add orders to use available coins.")
                 else:
                     # All coins already committed to existing orders
@@ -5228,7 +5253,7 @@ class OrderManager:
                     if newly_placeable_levels:
                         # There are placeable levels without orders - need to redistribute!
                         # Since all coins are committed to existing orders, we need to RESIZE
-                        logging.info(f"{self.symbol}: First run - {len(newly_placeable_levels)} placeable level(s) missing orders. "
+                        self._info(f"{self.symbol}: First run - {len(newly_placeable_levels)} placeable level(s) missing orders. "
                                    f"Resizing all orders to redistribute across {len(existing_sell_orders) + len(newly_placeable_levels)} levels.")
                         
                         # Cancel existing orders and rebuild with all placeable levels
@@ -5280,7 +5305,7 @@ class OrderManager:
                                 
                                 if response.get('status') == 'ok':
                                     order_id = response.get('id', 'unknown')
-                                    logging.info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
+                                    self._info(f"{self.symbol}: Placed sell order at {rounded_rate:.4f} "
                                                f"({level_pct}% above entry), size: {rounded_amount:.8f}")
                                     placed_amount += rounded_amount
                                     # Track order ID for fill detection
@@ -5298,7 +5323,7 @@ class OrderManager:
                         return
                     else:
                         # No newly placeable levels - keep existing orders
-                        logging.info(f"{self.symbol}: First Core sell ladder check or restart - {core_coins:.8f} coins, "
+                        self._info(f"{self.symbol}: First Core sell ladder check or restart - {core_coins:.8f} coins, "
                                    f"all committed to {len(existing_sell_orders)} orders. Keeping existing orders.")
                         # Only update prices if avg_entry changed, don't add orders
                         old_avg_entry = getattr(self, '_last_avg_entry', 0)
@@ -5384,7 +5409,7 @@ class OrderManager:
             # Only resize if balance actually increased (new buys), not if it decreased (sell filled)
             if old_core_coins == 0 or core_coins > old_core_coins:
                 unused_pct = (available_coins / core_coins) * 100 if core_coins > 0 else 0
-                logging.info(f"{self.symbol}: Core balance increased - significant uncommitted balance ({unused_pct:.1f}%). "
+                self._info(f"{self.symbol}: Core balance increased - significant uncommitted balance ({unused_pct:.1f}%). "
                            f"Rebalancing all Core orders to maintain proper weighted distribution.")
                 # Resize to redistribute tokens properly across all levels
                 self._resize_sell_orders(existing_sell_orders, core_coins, avg_entry)
@@ -5405,7 +5430,7 @@ class OrderManager:
             logging.warning(f"{self.symbol}: Insufficient Core coins available for new sell orders "
                           f"(total: {core_coins:.8f}, committed: {existing_sell_amount:.8f}, "
                           f"available: {available_coins:.8f}). All Core coins are already committed to existing orders.")
-            logging.info(f"{self.symbol}: Skipping Core sell order placement - waiting for existing orders to fill or cancel")
+            self._info(f"{self.symbol}: Skipping Core sell order placement - waiting for existing orders to fill or cancel")
             return
         
         # Calculate per-order amount for missing orders (equal distribution fallback)
@@ -5440,14 +5465,14 @@ class OrderManager:
         
         # Log skipped levels (current price is at or above sell price)
         for level_index, sell_level_pct, sell_price in skipped_levels:
-            logging.info(f"{self.symbol}: Skipping order at level {level_index} ({sell_level_pct}% = ${sell_price:.4f}) - "
+            self._info(f"{self.symbol}: Skipping order at level {level_index} ({sell_level_pct}% = ${sell_price:.4f}) - "
                        f"current price (${self.current_price:.4f}) is at or above this level. "
                        f"Will place when price drops below ${sell_price:.4f}")
         
         # Calculate number of placeable levels for correct weight normalization
         num_placeable = len(placeable_levels)
         if num_placeable == 0:
-            logging.info(f"{self.symbol}: No placeable Core sell levels - current price (${self.current_price:.4f}) is above all sell levels")
+            self._info(f"{self.symbol}: No placeable Core sell levels - current price (${self.current_price:.4f}) is above all sell levels")
             self._last_avg_entry = avg_entry
             self._last_core_coins = core_coins
             return
@@ -5526,7 +5551,7 @@ class OrderManager:
                 
                 if response.get('status') == 'ok':
                     order_id = response.get('id', 'unknown')
-                    logging.info(f"{self.symbol}: Placed Core sell order at {sell_price:.2f} "
+                    self._info(f"{self.symbol}: Placed Core sell order at {sell_price:.2f} "
                                f"({sell_level_pct}% above entry), size: {rounded_amount:.8f}")
                     # Update remaining coins after successful placement (use rounded_amount that was actually placed)
                     remaining_coins -= rounded_amount
@@ -5660,7 +5685,7 @@ class OrderManager:
         
         min_working = self._min_working_coins_threshold()
         if working_coins < min_working:
-            logging.info(
+            self._info(
                 f"{self.symbol}: Working slice too small ({working_coins:.8f} "
                 f"< {min_working:.8f}), skipping Working ladder"
             )
@@ -5676,10 +5701,10 @@ class OrderManager:
             if self.current_price >= entry_threshold:
                 pct_below_entry = ((avg_entry - self.current_price) / avg_entry * 100) if avg_entry > 0 else 0
                 if self.current_price >= avg_entry:
-                    logging.info(f"{self.symbol}: Price (${self.current_price:.4f}) >= avg entry (${avg_entry:.4f}) - "
+                    self._info(f"{self.symbol}: Price (${self.current_price:.4f}) >= avg entry (${avg_entry:.4f}) - "
                                 f"cancelling Working orders (Core handles selling when profitable)")
                 else:
-                    logging.info(f"{self.symbol}: Price (${self.current_price:.4f}) within {self.cancel_working_threshold_pct:.1f}% of avg entry (${avg_entry:.4f}, "
+                    self._info(f"{self.symbol}: Price (${self.current_price:.4f}) within {self.cancel_working_threshold_pct:.1f}% of avg entry (${avg_entry:.4f}, "
                                 f"{pct_below_entry:.2f}% below) - cancelling Working orders to preserve coins for Core orders")
                 
                 # Cancel all existing Working orders
@@ -5692,7 +5717,7 @@ class OrderManager:
                     try:
                         self.api.cancel_order(order.order_id, order_type="sell")
                         self._working_order_ids.discard(order.order_id)
-                        logging.info(f"{self.symbol}: Cancelled Working order {order.order_id} (price within {self.cancel_working_threshold_pct:.1f}% of entry)")
+                        self._info(f"{self.symbol}: Cancelled Working order {order.order_id} (price within {self.cancel_working_threshold_pct:.1f}% of entry)")
                     except Exception as e:
                         logging.warning(f"{self.symbol}: Failed to cancel Working order {order.order_id}: {e}")
                 
@@ -5719,7 +5744,7 @@ class OrderManager:
         # Save if any Working orders were removed (filled or cancelled externally)
         if len(self._working_order_ids) < old_working_count:
             removed_count = old_working_count - len(self._working_order_ids)
-            logging.info(f"{self.symbol}: {removed_count} Working order(s) filled/cancelled, updating tracking")
+            self._info(f"{self.symbol}: {removed_count} Working order(s) filled/cancelled, updating tracking")
             self._save_working_order_ids()
         
         working_orders = [order for order in existing_sell_orders if order.order_id in self._working_order_ids]
@@ -5751,7 +5776,7 @@ class OrderManager:
                 old_price = inferred_price
                 # Save inferred price so it persists for future checks
                 self._last_working_price = inferred_price
-                logging.info(f"{self.symbol}: Inferred last working price from orders: ${inferred_price:.4f} "
+                self._info(f"{self.symbol}: Inferred last working price from orders: ${inferred_price:.4f} "
                            f"(lowest order at ${lowest_order.rate:.4f}, first level {first_level}%)")
             else:
                 # No orders to infer from, use current price (first run)
@@ -5767,7 +5792,7 @@ class OrderManager:
         else:
             price_status = f"  price: tracking from ${self.current_price:.4f}"
         
-        logging.info(f"{self.symbol}: Working Sell Ladder Check\n"
+        self._info(f"{self.symbol}: Working Sell Ladder Check\n"
                     f"  existing: {len(working_orders)}\n"
                     f"  max_orders: {needed_orders}\n"
                     f"  current_price: {self.current_price:.4f}\n"
@@ -5799,7 +5824,7 @@ class OrderManager:
                 reason = "Working order(s) filled"
             else:
                 reason = f"order count mismatch ({len(working_orders)} vs {needed_orders} needed)"
-            logging.info(f"{self.symbol}: Recalculating Working ladder - {reason}")
+            self._info(f"{self.symbol}: Recalculating Working ladder - {reason}")
             self._cancel_working_orders(working_orders)
             time.sleep(0.5)
             working_orders = []
@@ -5815,7 +5840,7 @@ class OrderManager:
             )
             if needs_resize:
                 unused_pct = (available_coins / working_coins) * 100 if working_coins > 0 else 0
-                logging.info(f"{self.symbol}: Available Working coins ({available_coins:.8f}) significantly exceed committed ({existing_sell_amount:.8f}), "
+                self._info(f"{self.symbol}: Available Working coins ({available_coins:.8f}) significantly exceed committed ({existing_sell_amount:.8f}), "
                                f"{unused_pct:.1f}% unused. Resizing Working ladder to use full balance.")
                 self._cancel_working_orders(working_orders)
                 time.sleep(0.5)
@@ -5867,7 +5892,7 @@ class OrderManager:
                 if response.get('status') == 'ok':
                     order_id = response.get('id', 'unknown')
                     self._working_order_ids.add(order_id)
-                    logging.info(f"{self.symbol}: Placed Working sell order at {rounded_rate:.4f} "
+                    self._info(f"{self.symbol}: Placed Working sell order at {rounded_rate:.4f} "
                                f"({level_pct}% above current price), size: {rounded_amount:.8f}")
                     remaining_coins -= rounded_amount
                     placed_orders.append({
@@ -5887,7 +5912,7 @@ class OrderManager:
 
         if placed_orders:
             self._save_working_order_ids()
-            logging.info(f"{self.symbol}: Placed {len(placed_orders)} Working sell order(s)")
+            self._info(f"{self.symbol}: Placed {len(placed_orders)} Working sell order(s)")
             self.notifier.notify_sell_ladder_recalculated(
                 symbol=self.symbol,
                 orders=placed_orders,
@@ -5956,7 +5981,7 @@ class OrderManager:
                     self._replace_tracked_order_id(order.order_id, new_id, new_rate=new_rate)
                     order.order_id = new_id
                     order.rate = new_rate
-                    logging.info(f"{self.symbol}: Updated buy order {new_id} to {new_price:.2f}")
+                    self._info(f"{self.symbol}: Updated buy order {new_id} to {new_price:.2f}")
                     # Don't notify on order updates - too frequent, only log
                 else:
                     # Editing failed, mark for cancellation
@@ -6054,7 +6079,7 @@ class OrderManager:
                 
                 if response.get('status') == 'ok':
                     order_id = response.get('id', 'unknown')
-                    logging.info(f"{self.symbol}: Resized sell order {i+1}/{len(existing_prices)}: "
+                    self._info(f"{self.symbol}: Resized sell order {i+1}/{len(existing_prices)}: "
                                f"{rounded_amount:.8f} @ {rounded_rate:.4f} {self.market} (preserved price)")
                     remaining_coins -= rounded_amount
                     
@@ -6085,7 +6110,7 @@ class OrderManager:
                 order_type="Core"
             )
         
-        logging.info(f"{self.symbol}: Resized {len(existing_prices)} sell orders - preserved prices, updated amounts to use full balance")
+        self._info(f"{self.symbol}: Resized {len(existing_prices)} sell orders - preserved prices, updated amounts to use full balance")
         
         # Track price when orders were resized (for slow price drop detection)
         if self.current_price > 0:
@@ -6157,7 +6182,7 @@ class OrderManager:
                     order_id = response.get('id', 'unknown')
                     old_price = existing_orders[i].rate if i < len(existing_orders) else 0
                     price_change = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0
-                    logging.info(f"{self.symbol}: Resized and updated sell order {i+1}/{len(existing_orders)}: "
+                    self._info(f"{self.symbol}: Resized and updated sell order {i+1}/{len(existing_orders)}: "
                                f"{rounded_amount:.8f} @ {rounded_rate:.4f} {self.market} "
                                f"(was {old_price:.4f}, {price_change:+.2f}%)")
                     remaining_coins -= rounded_amount
@@ -6190,7 +6215,7 @@ class OrderManager:
                 order_type="Core"
             )
         
-        logging.info(f"{self.symbol}: Resized and updated {len(existing_orders)} sell orders - new prices based on avg_entry {avg_entry:.4f}, updated amounts to use full balance")
+        self._info(f"{self.symbol}: Resized and updated {len(existing_orders)} sell orders - new prices based on avg_entry {avg_entry:.4f}, updated amounts to use full balance")
         
         # Track price when orders were resized and updated (for slow price drop detection)
         if self.current_price > 0:
@@ -6214,7 +6239,7 @@ class OrderManager:
         preserved_details = []
         updated_details = []
         
-        logging.info(f"{self.symbol}: Evaluating {len(existing_orders)} sell orders for updates "
+        self._info(f"{self.symbol}: Evaluating {len(existing_orders)} sell orders for updates "
                     f"(avg_entry: {avg_entry:.4f})")
         
         for order in existing_orders:
@@ -6272,7 +6297,7 @@ class OrderManager:
                 continue
             
             # Price change is significant - attempt to update
-            logging.info(f"{self.symbol}: Updating sell order at {sell_level_pct}% "
+            self._info(f"{self.symbol}: Updating sell order at {sell_level_pct}% "
                         f"(current: ${order.rate:.4f} -> new: ${new_price:.4f}, "
                         f"diff: {price_diff_pct:.2f}% > {threshold}% threshold)")
             
@@ -6299,7 +6324,7 @@ class OrderManager:
                         'new_price': new_price,
                         'diff_pct': price_diff_pct
                     })
-                    logging.info(f"{self.symbol}: Successfully updated sell order {new_id} at {sell_level_pct}% "
+                    self._info(f"{self.symbol}: Successfully updated sell order {new_id} at {sell_level_pct}% "
                                f"(${old_rate:.4f} -> ${new_price:.4f}, change: {price_diff_pct:+.2f}%)")
                     # Don't notify on order updates - too frequent, only log
                 else:
@@ -6316,16 +6341,16 @@ class OrderManager:
         
         # Detailed summary logging
         if orders_updated > 0 or orders_preserved > 0 or orders_to_cancel:
-            logging.info(f"{self.symbol}: SELL ORDER UPDATE SUMMARY")
-            logging.info(f"{self.symbol}:   Total orders evaluated: {len(existing_orders)}")
-            logging.info(f"{self.symbol}:   Updated: {orders_updated}")
-            logging.info(f"{self.symbol}:   Preserved: {orders_preserved}")
-            logging.info(f"{self.symbol}:   To cancel/recreate: {len(orders_to_cancel)}")
+            self._info(f"{self.symbol}: SELL ORDER UPDATE SUMMARY")
+            self._info(f"{self.symbol}:   Total orders evaluated: {len(existing_orders)}")
+            self._info(f"{self.symbol}:   Updated: {orders_updated}")
+            self._info(f"{self.symbol}:   Preserved: {orders_preserved}")
+            self._info(f"{self.symbol}:   To cancel/recreate: {len(orders_to_cancel)}")
             
             if updated_details:
-                logging.info(f"{self.symbol}:   Updated orders details:")
+                self._info(f"{self.symbol}:   Updated orders details:")
                 for detail in updated_details:
-                    logging.info(f"{self.symbol}:      - Level {detail['level']:.1f}%: "
+                    self._info(f"{self.symbol}:      - Level {detail['level']:.1f}%: "
                                f"Order {detail['order_id']} "
                                f"${detail['old_price']:.4f} -> ${detail['new_price']:.4f} "
                                f"({detail['diff_pct']:+.2f}%)")
@@ -6335,12 +6360,12 @@ class OrderManager:
                 low_level_preserved = [d for d in preserved_details if d['level'] < 15.0]
                 
                 if high_level_preserved:
-                    logging.info(f"{self.symbol}:   High-level orders preserved (15%+): {len(high_level_preserved)}")
+                    self._info(f"{self.symbol}:   High-level orders preserved (15%+): {len(high_level_preserved)}")
                     for detail in high_level_preserved[:3]:  # Show first 3
-                        logging.info(f"{self.symbol}:      - Level {detail['level']:.1f}%: "
+                        self._info(f"{self.symbol}:      - Level {detail['level']:.1f}%: "
                                    f"${detail['current_price']:.4f} (diff: {detail['diff_pct']:.2f}%)")
                     if len(high_level_preserved) > 3:
-                        logging.info(f"{self.symbol}:      ... and {len(high_level_preserved) - 3} more")
+                        self._info(f"{self.symbol}:      ... and {len(high_level_preserved) - 3} more")
                 
                 if low_level_preserved:
                     logging.debug(f"{self.symbol}:   Low-level orders preserved (<15%): {len(low_level_preserved)}")
@@ -6350,9 +6375,9 @@ class OrderManager:
                                     f"${detail['current_price']:.4f} (diff: {detail['diff_pct']:.2f}%)")
             
             if orders_to_cancel:
-                logging.info(f"{self.symbol}:   Orders to cancel/recreate: {len(orders_to_cancel)}")
+                self._info(f"{self.symbol}:   Orders to cancel/recreate: {len(orders_to_cancel)}")
                 for order in orders_to_cancel[:3]:  # Show first 3
-                    logging.info(f"{self.symbol}:      - Order {order.order_id} at ${order.rate:.4f}")
+                    self._info(f"{self.symbol}:      - Order {order.order_id} at ${order.rate:.4f}")
         
         # Cancel orders that couldn't be edited
         for order in orders_to_cancel:
@@ -6389,7 +6414,7 @@ class OrderManager:
                 self._last_sync_time = current_time
             # Also sync periodically during normal operation (every 10 minutes)
             elif self.coin_balance > 0 and (current_time - self._last_sync_time) >= self._sync_interval:
-                logging.info(f"{self.symbol}: 🔍 Periodic sync check (last sync was {int(current_time - self._last_sync_time)}s ago)")
+                self._info(f"{self.symbol}: 🔍 Periodic sync check (last sync was {int(current_time - self._last_sync_time)}s ago)")
                 self._detect_and_sync_missing_fills()
                 self._last_sync_time = current_time
             
@@ -6443,18 +6468,19 @@ class OrderManager:
                 self.spread_pct = 0.0
             
             # ========== START TRADING CYCLE ==========
-            logging.info(f"{self.symbol}: ========== START TRADING CYCLE ==========")
+            self._begin_cycle_log()
+            self._info(f"{self.symbol}: ========== START TRADING CYCLE ==========")
             
             # Reset sell-fill flag for this cycle (Option B: don't resize on sell fills)
             self._sell_filled_this_cycle = False
             
             # --- Section: Price Information ---
-            logging.info(f"{self.symbol}: --- Price Information ---")
+            self._info(f"{self.symbol}: --- Price Information ---")
             if bid_price and ask_price and last_price and spread_abs and spread_pct:
-                logging.info(f"{self.symbol}: Price|bid={bid_price:.4f}|ask={ask_price:.4f}|last={last_price:.4f}|"
+                self._info(f"{self.symbol}: Price|bid={bid_price:.4f}|ask={ask_price:.4f}|last={last_price:.4f}|"
                            f"mid={mid_price:.4f}|spread_abs={spread_abs:.4f}|spread_pct={spread_pct:.3f}%")
             elif last_price:
-                logging.info(f"{self.symbol}: Price|last={last_price:.4f}|bid=N/A|ask=N/A|spread=N/A")
+                self._info(f"{self.symbol}: Price|last={last_price:.4f}|bid=N/A|ask=N/A|spread=N/A")
             
             if price and price > 0:
                 self.update_price(price)
@@ -6462,10 +6488,11 @@ class OrderManager:
                 self._update_rolling_price_high()
             else:
                 logging.warning(f"{self.symbol}: Could not get valid price data: {price_data}")
+                self._flush_cycle_log(suffix=" (aborted)")
                 return
             
             # --- Section: Position Health ---
-            logging.info(f"{self.symbol}: --- Position Health ---")
+            self._info(f"{self.symbol}: --- Position Health ---")
             self.log_position_health()
             
             # Get open orders (handle gracefully if API endpoint doesn't work)
@@ -6594,13 +6621,13 @@ class OrderManager:
                                 expected_increase = missing_order.amount
                                 if saved:
                                     if "via API" in verification_note:
-                                        logging.info(
+                                        self._info(
                                             f"{self.symbol}: Verified token receipt via API. "
                                             f"Balance: {self.previous_coin_balance:.8f} -> {self.coin_balance:.8f} "
                                             f"(+{coin_balance_change:.8f}). Saved order {order_id} to JSON."
                                         )
                                     else:
-                                        logging.info(
+                                        self._info(
                                             f"{self.symbol}: Verified token receipt via balance - increased from "
                                             f"{self.previous_coin_balance:.8f} to {self.coin_balance:.8f} "
                                             f"(+{coin_balance_change:.8f}, expected ~{expected_increase:.8f}). "
@@ -6608,12 +6635,12 @@ class OrderManager:
                                         )
                                 self.total_coins += missing_order.amount
                                 self.total_invested += missing_order.amount * missing_order.rate
-                                logging.info(
+                                self._info(
                                     f"{self.symbol}: Tracked buy fill - {missing_order.amount:.8f} @ {missing_order.rate:.4f}, "
                                     f"total: {self.total_coins:.8f} coins, ${self.total_invested:.2f} invested"
                                 )
 
-                            logging.info(f"{self.symbol}: Order {order_id} ({missing_order.side}) FILLED - "
+                            self._info(f"{self.symbol}: Order {order_id} ({missing_order.side}) FILLED - "
                                        f"{missing_order.amount:.8f} @ {missing_order.rate:.4f}{price_note}{verification_note}")
 
                             # Track filled sell orders (reduce tracked position via LIFO)
@@ -6658,7 +6685,7 @@ class OrderManager:
                                 
                                 # Update daily realized profit
                                 self.daily_realized_profit += sell_profit
-                                logging.info(f"{self.symbol}: Sell profit: ${sell_profit:.2f}, "
+                                self._info(f"{self.symbol}: Sell profit: ${sell_profit:.2f}, "
                                            f"Daily total: ${self.daily_realized_profit:.2f}")
                                 
                                 # Execute skim if conditions met (uses sell profit, not daily total)
@@ -6670,7 +6697,7 @@ class OrderManager:
                                 # Only save if not already in JSON
                                 if not order_already_in_json:
                                     self._save_filled_sell_order(missing_order, fill_timestamp)
-                                    logging.info(f"{self.symbol}: Sell order filled - position reduced by {missing_order.amount:.8f} "
+                                    self._info(f"{self.symbol}: Sell order filled - position reduced by {missing_order.amount:.8f} "
                                                f"@ {missing_order.rate:.4f} = ${missing_order.amount * missing_order.rate:.2f}")
                                 else:
                                     logging.debug(f"{self.symbol}: Sell order {order_id} already in JSON, skipping save (already processed by sync)")
@@ -6709,22 +6736,24 @@ class OrderManager:
                 )
             
             if not orders_fetch_ok:
-                logging.info(f"{self.symbol}: ========== END TRADING CYCLE (orders fetch failed) ==========")
+                self._flush_cycle_log(suffix=" (orders fetch failed)")
                 return
 
             # --- Section: Buy Ladder ---
-            logging.info(f"{self.symbol}: --- Buy Ladder ---")
+            self._info(f"{self.symbol}: --- Buy Ladder ---")
             self.place_buy_ladder()
             
             
             # --- Section: Sell Ladder ---
-            logging.info(f"{self.symbol}: --- Sell Ladder ---")
+            self._info(f"{self.symbol}: --- Sell Ladder ---")
             self.place_sell_ladder()
             
             # ========== END TRADING CYCLE ==========
-            logging.info(f"{self.symbol}: ========== END TRADING CYCLE ==========")
+            self._flush_cycle_log()
             
         except Exception as e:
+            if self._cycle_logging or self._cycle_log_buffer:
+                self._flush_cycle_log(suffix=" (error)")
             logging.error(f"{self.symbol}: Error in process loop: {e}")
             self.notifier.notify_error(self.symbol, str(e))
 
