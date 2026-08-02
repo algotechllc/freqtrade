@@ -72,8 +72,10 @@ trading:
     working_price_update_threshold: 3.0
 
   order_size_distribution: weighted
+  # Both ladders taper away from current price: most size on the near rungs that fill
+  # often, far rungs (deep buys / +25-50% sells) kept small as spike insurance.
   buy_order_distribution: weighted
-  sell_order_distribution: equal
+  sell_order_distribution: weighted
   small_position_multiplier: 1.0
   small_position_threshold: 0.5
 

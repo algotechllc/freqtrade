@@ -3260,7 +3260,7 @@ class OrderManager:
             total_levels: Total number of levels
             total_amount: Total amount to distribute
             is_sell_order: If True, use inverse-weighted for weighted distribution (larger at lower profit levels)
-                          If False (buy orders), use standard weighted (larger at deeper discounts)
+                          If False (buy orders), use inverse-weighted (larger at shallower discounts)
             buy_level_pct: Optional buy level percentage (e.g., 0.5, 1.0, 1.5). Used to apply small position multiplier
                           for levels at or below small_position_threshold
         """
@@ -3277,21 +3277,18 @@ class OrderManager:
             if total_levels == 1:
                 base_size = total_amount
             else:
-                # For sell orders, use inverse-weighted (larger at lower profit levels for better risk management)
-                # For buy orders, use probability-weighted (larger at shallower discounts that are more likely to fill)
-                # Rationale: Shallow discounts (0.8-5%) fill frequently, deep discounts (10-18%) fill rarely
-                # We want more capital deployed where it's more likely to execute
+                # Both sides taper away from the current price: size concentrates on the
+                # near levels that fill frequently, leaving the far levels as small
+                # standing insurance against a spike or crash rather than the bulk of
+                # the allocation.
                 if is_sell_order:
-                    # Inverse-weighted: first level (lowest profit) gets highest weight
                     # level_index 0 (lowest profit) = 1.5, level_index (total_levels-1) (highest profit) = 0.5
                     weight_range = 1.5 - 0.5  # 1.0
                     weight = 1.5 - (weight_range * level_index / max(1, total_levels - 1))
                 else:
-                    # Reverse-weighted: deeper discounts get larger orders (better entry prices)
-                    # level_index 0 (closest/shallowest) = 0.7, level_index (total_levels-1) (deepest) = 1.3
-                    # This preserves capital for better entry opportunities at deeper discounts
+                    # level_index 0 (shallowest discount) = 1.3, level_index (total_levels-1) (deepest) = 0.7
                     weight_range = 1.3 - 0.7  # 0.6
-                    weight = 0.7 + (weight_range * level_index / max(1, total_levels - 1))
+                    weight = 1.3 - (weight_range * level_index / max(1, total_levels - 1))
                 
                 # Calculate total weight for normalization
                 total_weight = 0.0
@@ -3299,8 +3296,7 @@ class OrderManager:
                     if is_sell_order:
                         level_weight = 1.5 - (weight_range * i / max(1, total_levels - 1))
                     else:
-                        # Buy orders: deeper discounts (higher index) get higher weight
-                        level_weight = 0.7 + (weight_range * i / max(1, total_levels - 1))
+                        level_weight = 1.3 - (weight_range * i / max(1, total_levels - 1))
                     total_weight += level_weight
                 
                 if total_weight <= 0:
@@ -4571,12 +4567,66 @@ class OrderManager:
         
         # Mean-reversion mode: Split position into Core and Working
         if self.mean_reversion_enabled:
-            # Calculate Core and Working allocations
-            self.working_coins = coin_amount * self.working_position_pct
-            self.core_coins = coin_amount - self.working_coins
+            # Decide whether the Working ladder will actually place BEFORE splitting the
+            # position. The Working slice is only carved out when it has somewhere to go;
+            # otherwise it reverts to Core rather than sitting idle on neither ladder.
+            # Working only runs while underwater by more than cancel_working_threshold_pct
+            # (mirrors the guard in _place_working_sell_ladder) - near or above avg entry
+            # Core handles selling at a profit.
+            candidate_working = coin_amount * self.working_position_pct
+            min_working = self._min_working_coins_threshold()
             
-            self._info(f"{self.symbol}: Mean-reversion mode: Core={self.core_coins:.8f} ({100*(1-self.working_position_pct):.1f}%), "
-                        f"Working={self.working_coins:.8f} ({100*self.working_position_pct:.1f}%)")
+            if avg_entry > 0:
+                entry_threshold = avg_entry * (1.0 - self.cancel_working_threshold_pct / 100.0)
+                below_working_threshold = self.current_price < entry_threshold
+            else:
+                below_working_threshold = True
+            
+            working_active = (
+                self.working_ladder_enabled
+                and candidate_working >= min_working
+                and self.current_price > 0
+                and below_working_threshold
+            )
+            
+            if working_active:
+                self.working_coins = candidate_working
+                self.core_coins = coin_amount - self.working_coins
+                self._info(f"{self.symbol}: Mean-reversion mode: Core={self.core_coins:.8f} ({100*(1-self.working_position_pct):.1f}%), "
+                            f"Working={self.working_coins:.8f} ({100*self.working_position_pct:.1f}%)")
+            else:
+                # Working stood down - cancel any leftover Working orders first so their
+                # coins are free before Core sizes against the full position.
+                if not hasattr(self, '_working_order_ids'):
+                    self._working_order_ids = set()
+                stale_working = [
+                    order for order in self.get_sell_orders()
+                    if order.order_id in self._working_order_ids
+                ]
+                if stale_working:
+                    self._info(f"{self.symbol}: Working ladder standing down - cancelling {len(stale_working)} "
+                               f"Working order(s) and returning the slice to Core")
+                    self._cancel_working_orders(stale_working)
+                    time.sleep(0.5)
+                
+                self.working_coins = 0.0
+                self.core_coins = coin_amount
+                
+                if not self.working_ladder_enabled:
+                    logging.debug(f"{self.symbol}: Working ladder disabled in config - full position allocated to Core")
+                elif self.current_price <= 0:
+                    logging.warning(f"{self.symbol}: Cannot place Working ladder - no current price available")
+                elif not below_working_threshold:
+                    pct_below_entry = ((avg_entry - self.current_price) / avg_entry * 100) if avg_entry > 0 else 0.0
+                    self._info(f"{self.symbol}: Price (${self.current_price:.4f}) within {self.cancel_working_threshold_pct:.1f}% of "
+                               f"avg entry (${avg_entry:.4f}, {pct_below_entry:.2f}% below) - "
+                               f"Working ladder off, full position allocated to Core")
+                else:
+                    self._info(
+                        f"{self.symbol}: Working slice too small ({candidate_working:.8f} "
+                        f"< {min_working:.8f} min for ${self.min_order_size:.2f} orders) - "
+                        f"full position allocated to Core"
+                    )
             
             # Place Core ladder (recovery strategy - relative to avg_entry)
             if self.core_coins >= min_meaningful_balance:
@@ -4585,32 +4635,8 @@ class OrderManager:
                 self._info(f"{self.symbol}: Core position too small ({self.core_coins:.8f}), skipping Core ladder")
             
             # Place Working ladder (mean-reversion strategy - relative to current_price)
-            # CRITICAL: Only place Working orders when price is BELOW average entry
-            # When price is above entry, Core orders handle selling (recovery strategy)
-            # Working orders are for mean-reversion when underwater, not for trending markets
-            price_below_entry = self.current_price < avg_entry if avg_entry > 0 else True
-            
-            min_working = self._min_working_coins_threshold()
-            if (
-                self.working_ladder_enabled
-                and self.working_coins >= min_working
-                and self.current_price > 0
-                and price_below_entry
-            ):
+            if working_active:
                 self._place_working_sell_ladder(self.working_coins, avg_entry)
-            else:
-                if not self.working_ladder_enabled:
-                    logging.debug(f"{self.symbol}: Working ladder disabled in config")
-                elif self.working_coins < min_working:
-                    self._info(
-                        f"{self.symbol}: Working slice too small ({self.working_coins:.8f} "
-                        f"< {min_working:.8f} min for ${self.min_order_size:.2f} orders), skipping Working ladder"
-                    )
-                elif self.current_price <= 0:
-                    logging.warning(f"{self.symbol}: Cannot place Working ladder - no current price available")
-                elif not price_below_entry:
-                    self._info(f"{self.symbol}: Price (${self.current_price:.4f}) >= avg entry (${avg_entry:.4f}) - "
-                               f"disabling Working ladder (Core handles selling when profitable)")
         else:
             # Recovery mode: All position is Core (existing behavior)
             self.core_coins = coin_amount
