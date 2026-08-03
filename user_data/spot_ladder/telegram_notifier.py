@@ -1,11 +1,11 @@
-"""No-op notifier when notifications.provider=none (Slack is in slack_notifier.py)."""
+"""No-op notifier stub (notifications.provider=none). Slack: slack_notifier.py."""
 
 import logging
 from typing import Any, Optional
 
 
 class TelegramNotifier:
-    """Stub: preserves OrderManager call sites without sending messages."""
+    """No-op notifier (historical class name; Slack is the live implementation)."""
 
     def __init__(
         self,

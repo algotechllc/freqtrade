@@ -1,4 +1,4 @@
-"""Slack notifications for spot ladder (same hooks as legacy Telegram notifier)."""
+"""Slack notifications for the ladder bot (OrderManager notifier interface)."""
 
 from __future__ import annotations
 

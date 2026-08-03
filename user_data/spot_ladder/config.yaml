@@ -1,4 +1,6 @@
-# Ladder configuration for Hyperliquid XRP/USDC (XRP perp in CCXT: XRP/USDC:USDC).
+# Spot ladder — Hyperliquid XRP/USDC perp limit-order bot (Freqtrade host + OrderManager).
+# Strategy: buy ladder below market; Core sells above avg entry; Working sells above
+# market when underwater (mean_reversion). See user_data/README.md.
 paths:
   state_dir: spot_ladder/state
 
@@ -6,7 +8,7 @@ paths:
 ccxt_pairs:
   XRP/USDC: XRP/USDC:USDC
 
-# Ladder alerts (legacy bot used Telegram; this fork posts to Slack).
+# Ladder alerts via Slack (notifications.provider). Freqtrade telegram.enabled stays off.
 notifications:
   provider: slack
   dry_run_label: true
@@ -145,5 +147,5 @@ reporting:
   timezone: UTC
   # Run today → report yesterday (-1). Use 0 for the current UTC day.
   summary_date_offset_days: -1
-  # Cron example (9:35 UTC ≈ same wall-clock as legacy; activity buckets are UTC):
+  # Cron example (9:35 UTC; activity buckets use reporting.timezone):
   # 35 9 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py >> /home/ubuntu/freqtrade/user_data/logs/daily_summary.log 2>&1

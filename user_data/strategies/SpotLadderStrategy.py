@@ -1,7 +1,9 @@
 # pragma pylint: disable=missing-docstring, unused-argument
 """
-Spot ladder strategy — runs OrderManager on each bot loop (live/dry-run only).
-Freqtrade trade signals are unused; exchange limit ladders are managed directly.
+Spot ladder strategy — Freqtrade shell for the Hyperliquid ladder bot.
+
+Runs OrderManager on bot_loop_start every trading.loop_interval seconds (live/dry-run).
+Freqtrade candle/signal hooks are unused; limit ladders are placed via the exchange adapter.
 """
 
 from __future__ import annotations

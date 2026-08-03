@@ -1,7 +1,7 @@
 """
-Dry-run balance simulation for the spot ladder (Hyperliquid / no wallet).
+Dry-run balance simulation for the Hyperliquid ladder (perp; no on-chain wallet in dry-run).
 
-Freqtrade's Wallets only track Trade DB rows; ladder orders use exchange.create_order
+Freqtrade Wallets only track Trade DB rows; ladder orders use exchange.create_order
 directly. Balances are derived from:
   1. Closed/open dry-run CCXT orders on the exchange instance, when present
   2. Otherwise filled_orders_{COIN}.json (for restarts and manual test seeding)

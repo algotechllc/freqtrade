@@ -1,7 +1,8 @@
 """
-Daily ladder summary — same sections/metrics as the legacy Telegram daily_summary.
+Daily ladder summary — portfolio, activity, and P&L from the filled_orders ledger.
 
-Built from filled_orders JSON, optional dry-run order book, and market price fetch.
+Built from filled_orders JSON, optional dry-run order book sync, and a live price fetch.
+Posted to Slack via daily_summary_slack.py (reporting.enabled + cron).
 """
 
 from __future__ import annotations
@@ -92,9 +93,9 @@ def calculate_average_entry_from_stored_orders(
     state_dir: str | Path,
 ) -> tuple[float, float, float]:
     """
-    Average entry from unconsumed buy lots (same scaling as legacy daily summary).
+    Average entry from unconsumed buy lots (LIFO ledger; unconsumed amount per row).
 
-    Returns (avg_entry, fifo_coins, total_cost).
+    Returns (avg_entry, held_coins, total_cost).
     """
     path = Path(state_dir) / f"filled_orders_{cointype.upper()}.json"
     if not path.is_file():
@@ -601,7 +602,7 @@ def build_daily_summary(
 
 
 def format_daily_summary(report: DailySummaryReport) -> str:
-    """Format like legacy Telegram daily summary."""
+    """Format daily summary text for Slack (markdown-style bullets)."""
     lines = [
         f"*DAILY SUMMARY - {report.symbol}*",
         f"Date: {_fmt_report_date(report.report_date)}",

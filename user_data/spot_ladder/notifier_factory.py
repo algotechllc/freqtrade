@@ -1,4 +1,4 @@
-"""Build ladder notifier from spot_ladder/config.yaml (+ env secrets)."""
+"""Build ladder notifier from spot_ladder/config.yaml (Slack default; none = TelegramNotifier stub)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ logger = logging.getLogger(__name__)
 
 def create_ladder_notifier(ladder_config: dict[str, Any], freqtrade_config: dict[str, Any]) -> Any:
     """
-    notifications.provider: slack | none (default slack if webhook configured, else none)
+    notifications.provider: slack | none (default slack if webhook configured, else none).
+
+    Telegram provider is unimplemented; falls back to the no-op TelegramNotifier stub.
     """
     notif = ladder_config.get("notifications") or {}
     provider = (notif.get("provider") or "slack").lower().strip()

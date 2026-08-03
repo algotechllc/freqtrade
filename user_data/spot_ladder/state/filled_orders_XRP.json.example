@@ -4,7 +4,7 @@
   "market": "USDC",
   "last_updated": "2026-07-29T00:00:00+00:00",
   "metadata": {
-    "note": "Dry-run seed: fills oldest→newest run 2.00 down to 1.10 (shallow first, deepest last). dry_run_wallet 2550 => $1000 USDC remaining."
+    "note": "Dry-run seed only. 1000 XRP @ 1.10–2.00; with dry_run_wallet 3550 in config.json => ~$1000 USDC remaining."
   },
   "buy_orders": [
     {

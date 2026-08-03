@@ -1,1 +1,1 @@
-"""Spot ladder bot logic vendored for Freqtrade + Hyperliquid."""
+"""Spot ladder OrderManager and helpers — Freqtrade + Hyperliquid XRP/USDC perp."""

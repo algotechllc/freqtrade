@@ -1,6 +1,13 @@
 """
-Order Management System
-Handles buy/sell ladder logic, order placement, and updates
+Hyperliquid ladder bot — buy/sell limit order management.
+
+Each cycle (driven by SpotLadderStrategy + trading.loop_interval):
+  - Buy ladder below last price (weighted sizing; optional price_elevation throttling)
+  - Core sell ladder above average entry (recovery; LIFO ledger in filled_orders JSON)
+  - Working sell ladder above current price when underwater (mean_reversion config)
+
+Exchange I/O goes through the adapter (HyperliquidExchangeAdapter); notifications
+through the notifier interface (Slack by default).
 """
 import logging
 import time
@@ -195,9 +202,10 @@ class OrderManager:
         self.working_position_pct = mean_reversion_config.get('working_position_pct', 0.15)  # Default 15% working
         self.working_sell_levels = mean_reversion_config.get('working_sell_levels', [1.0, 2.0, 3.0, 4.0, 5.0])
         self.cancel_working_threshold_pct = mean_reversion_config.get('cancel_working_threshold_pct', 5.0)  # Default 5% below entry
-        # Working ladder price update threshold (default 5.0% - higher than first two levels to allow fills)
-        # When price moves by this amount, Working orders are cancelled and recreated at new levels
-        # Should be set higher than first two working_sell_levels (typically 3%, 4%) to maximize fill opportunities
+        # Working ladder price update threshold (default 3.0% — config working_price_update_threshold)
+        # When price moves by this amount, Working orders are cancelled and recreated at new levels.
+        # Set above the first working_sell_levels (e.g. 1.5%, 1.75%) so near-price rungs can fill
+        # before the ladder recenters.
         self.working_price_update_threshold = mean_reversion_config.get('working_price_update_threshold', 5.0)
         self.working_ladder_enabled = mean_reversion_config.get('working_ladder_enabled', False)
         
@@ -293,9 +301,10 @@ class OrderManager:
         self.working_position_pct = mean_reversion_config.get('working_position_pct', 0.15)
         self.working_sell_levels = mean_reversion_config.get('working_sell_levels', [1.0, 2.0, 3.0, 4.0, 5.0])
         self.cancel_working_threshold_pct = mean_reversion_config.get('cancel_working_threshold_pct', 5.0)
-        # Working ladder price update threshold (default 5.0% - higher than first two levels to allow fills)
-        # When price moves by this amount, Working orders are cancelled and recreated at new levels
-        # Should be set higher than first two working_sell_levels (typically 3%, 4%) to maximize fill opportunities
+        # Working ladder price update threshold (default 3.0% — config working_price_update_threshold)
+        # When price moves by this amount, Working orders are cancelled and recreated at new levels.
+        # Set above the first working_sell_levels (e.g. 1.5%, 1.75%) so near-price rungs can fill
+        # before the ladder recenters.
         self.working_price_update_threshold = mean_reversion_config.get('working_price_update_threshold', 5.0)
         self.working_ladder_enabled = mean_reversion_config.get('working_ladder_enabled', False)
         self.sell_ladder_rebalance_threshold = config['trading'].get('sell_ladder_rebalance_threshold_pct', 5.0) / 100.0
@@ -1383,7 +1392,7 @@ class OrderManager:
     
     def _should_telegram_notify_synced_fill(self, fill_timestamp: str, is_startup: bool,
                                             baseline_last_updated: 'Optional[datetime]' = None) -> bool:
-        """Only Telegram-notify synced fills that are plausibly new — avoids belated alerts for old trades.
+        """Only notifier-push synced fills that are plausibly new — avoids belated Slack alerts for old trades.
 
         baseline_last_updated must be the JSON last_updated captured BEFORE this sync run wrote
         anything; otherwise the buy-sync rewrites last_updated to "now" and would suppress every
@@ -1476,8 +1485,8 @@ class OrderManager:
     def _verify_order_via_api(self, order: 'Order') -> bool:
         """Verify if an order was filled by checking the completed orders API.
         
-        This is used as a fallback when balance-based verification fails due to
-        concurrent fills (e.g., buy and sell filling in the same cycle).
+        Primary fill check in process(); balance change is the secondary signal when
+        the API has no match (e.g. concurrent fills in one cycle).
         
         Returns True if the order is found in completed orders, False otherwise.
         """
@@ -1584,7 +1593,7 @@ class OrderManager:
         # Get the last_updated timestamp from JSON
         json_last_updated = self._get_json_last_updated()
         # Immutable snapshot of the bot's last-known activity, taken BEFORE any sync writes.
-        # Used to decide which fills are "new" for startup Telegram notifications.
+        # Used to decide which fills are "new" for startup notifier alerts (Slack when configured).
         baseline_last_updated = json_last_updated
         
         # IMPROVED: Always check for orders newer than last_updated (regardless of balance threshold)
@@ -1836,7 +1845,7 @@ class OrderManager:
                         self._notify_buy_fill_if_needed(stub, amount, rate)
                     else:
                         self._info(
-                            f"{self.symbol}: Skipping Telegram for synced buy fill "
+                            f"{self.symbol}: Skipping notifier for synced buy fill "
                             f"({amount:.8f} @ {rate:.4f}, date: {(solddate or '')[:19]}) — fill too old for sync notify"
                         )
                 
@@ -1855,17 +1864,17 @@ class OrderManager:
                 # Determine if this is startup or periodic sync based on _startup_sync_done flag
                 sync_type = "Startup sync" if not self._startup_sync_done else "Periodic sync"
                 
-                # Only notify on startup sync, not periodic syncs (to reduce Telegram noise)
+                # Only notify on startup sync, not periodic syncs (to reduce Slack noise)
                 if not self._startup_sync_done:
                     self.notifier.notify_status(
                         f"🔄 {self.symbol}: {sync_type} - synced {synced_count} missing order(s), "
                         f"total: {synced_amount:.4f} coins"
                     )
                 else:
-                    # Log periodic syncs but don't send to Telegram
+                    # Log periodic syncs but don't push to Slack
                     self._info(
                         f"{self.symbol}: {sync_type} - synced {synced_count} missing order(s), "
-                        f"total: {synced_amount:.4f} coins (logged only, not sent to Telegram)"
+                        f"total: {synced_amount:.4f} coins (logged only, not sent to Slack)"
                     )
             elif missing_orders:
                 logging.warning(
@@ -1955,7 +1964,7 @@ class OrderManager:
                             )
                         else:
                             self._info(
-                                f"{self.symbol}: Skipping Telegram for synced sell fill "
+                                f"{self.symbol}: Skipping notifier for synced sell fill "
                                 f"({amount:.8f} @ {rate:.4f}, date: {solddate[:19]}) — fill too old for sync notify"
                             )
                     if synced_sell_count:
@@ -2514,10 +2523,10 @@ class OrderManager:
     def _update_rolling_price_high(self):
         """Update the rolling price distribution stats over the configured window.
         
-        Maintains the window of observed prices and recomputes the high, low, mean
-        and — most importantly for the mean-reversion anchor — the percentile rank
-        of the current price within that distribution. The percentile is what the
-        price-elevation tiers are matched against (see _get_price_elevation_tier).
+        Maintains the window of observed prices and recomputes the high, low, mean,
+        and the percentile rank of the current price within that distribution.
+        The percentile drives price_elevation buy-ladder tiers (see _get_price_elevation_tier).
+        Separate from Core/Working mean_reversion sell logic.
         """
         if not self.price_elevation_enabled:
             return
@@ -2566,7 +2575,7 @@ class OrderManager:
             self._info(f"{self.symbol}: Rolling {window_days:.0f}-day high updated: "
                        f"${old_high:.4f} -> ${self.rolling_price_high:.4f}")
         
-        # Save to disk every 5 cycles (~5 minutes at 60s intervals)
+        # Save to disk every 5 OrderManager cycles (~10 min at default loop_interval 120s)
         self._price_high_save_counter += 1
         if self._price_high_save_counter >= 5:
             self._save_price_high_history()
@@ -2576,9 +2585,9 @@ class OrderManager:
         """Select the buy-ladder tier from the current price's percentile rank.
         
         The anchor is the percentile rank of the current price within the rolling
-        window distribution (a true mean-reversion signal): cheap prices (low
-        percentile) get aggressive allocation and the full ladder, expensive prices
-        (high percentile) get reduced allocation and skip shallow rungs.
+        window distribution: cheap prices (low percentile) get aggressive allocation
+        and the full ladder; expensive prices (high percentile) get reduced allocation
+        and skip shallow rungs. Independent of Core/Working sell mean_reversion.
         
         Returns the matched tier dict plus:
         - percentile: the current price's percentile rank (0-100)
@@ -3470,7 +3479,7 @@ class OrderManager:
         # Log price elevation status if enabled
         if self.price_elevation_enabled and self.rolling_price_high > 0:
             window_days = self.price_elevation_window_hours / 24
-            self._info(f"{self.symbol}: Price Elevation Protection (mean-reversion):\n"
+            self._info(f"{self.symbol}: Price Elevation Protection (buy allocation):\n"
                         f"  {window_days:.0f}-day range: ${self.rolling_price_low:.4f} - ${self.rolling_price_high:.4f} (mean ${self.rolling_price_mean:.4f})\n"
                         f"  current price: ${self.current_price:.4f}\n"
                         f"  percentile: {percentile:.1f}th (0=cheapest, 100=most expensive)\n"
@@ -5951,7 +5960,7 @@ class OrderManager:
         """Update existing buy orders to match new price levels
         
         Deep levels (15%+) only reposition on DOWN moves to allow them to fill on retracements.
-        Shallow levels (2-14%) reposition on both up and down moves to catch quick dips.
+        Shallow levels (below 15%) reposition on both up and down moves to catch quick dips.
         """
         if len(existing_orders) == 0 or self.current_price == 0:
             return

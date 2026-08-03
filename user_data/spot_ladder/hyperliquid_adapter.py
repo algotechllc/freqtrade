@@ -1,6 +1,8 @@
 """
-Hyperliquid exchange adapter using the response shape expected by OrderManager.
-Uses Freqtrade's CCXT exchange instance (sync wrappers).
+Hyperliquid exchange adapter — CCXT response shape expected by OrderManager.
+
+Uses Freqtrade's CCXT instance (sync). Trades XRP/USDC:USDC perp: quote = free USDC
+collateral; base inventory = long position size when trading_mode=futures.
 """
 
 from __future__ import annotations

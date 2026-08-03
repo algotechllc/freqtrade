@@ -2,6 +2,25 @@
 
 Deployable ladder config and code are tracked in git. Runtime files stay on the server only.
 
+## Strategy overview
+
+Freqtrade is the process host only: `SpotLadderStrategy` does not emit trade signals. On each live/dry-run loop it runs `OrderManager` (see `spot_ladder/config.yaml` → `trading.loop_interval`, default 120s).
+
+**Market:** Hyperliquid **XRP/USDC perp** (`XRP/USDC:USDC` in CCXT). Collateral is USDC; long position size is treated as XRP inventory for ladder sizing.
+
+**Buy ladder:** Limit buys placed below last price at configured `%` rungs (`buy_levels`, default 0.5–15%). Size uses weighted distribution (more on near rungs). The ladder reprices when price moves beyond `price_update_threshold` (and related time windows). Up to `balance_percentage_per_symbol` of free USDC is committed (default 90%). Optional `price_elevation` (disabled by default) can reduce allocation and skip shallow rungs when price is high in a rolling window.
+
+**Sell ladders (mean-reversion enabled):** Position splits into **Core** (~90%) and **Working** (~10%, `working_position_pct`):
+
+- **Core** — recovery sells at `sell_levels` % above **average entry** (from `filled_orders_{COIN}.json`, LIFO consumption). Active whenever there is a meaningful position.
+- **Working** — sells at `working_sell_levels` % above **current price** while underwater (price more than `cancel_working_threshold_pct` below avg entry). Cancelled near/above entry so Core keeps higher-margin exits. Tracked by order id in `working_orders_{COIN}.json`.
+
+With `mean_reversion.enabled: false`, the full position uses the Core ladder only.
+
+**Ledger:** Buys and sells persist to `spot_ladder/state/filled_orders_{COIN}.json`. Sell profit and consumption use **LIFO** (newest buys consumed first). Dry-run open/closed orders also persist to `dry_run_orders_{COIN}.json` so restarts adopt the book like live `fetch_open_orders`.
+
+**Notifications:** Ladder fills/errors via Slack (`notifications.provider: slack`), not Freqtrade’s built-in Telegram. Daily summary: `reporting.enabled` + cron on `daily_summary_slack.py`.
+
 ## Tracked in git
 
 - `config.json` — bot settings (no secrets; keys live in `config-private.json`)
@@ -37,7 +56,7 @@ Dry-run open/closed ladder orders are persisted to `spot_ladder/state/dry_run_or
 
 ## Slack notifications (ladder bot)
 
-Uses the same `OrderManager` hooks as the legacy Telegram bot (`notify_order_filled`, ladder recalc messages, errors). **Not** Freqtrade’s built-in Telegram.
+`OrderManager` calls the notifier interface (`notify_order_filled`, ladder recalc, errors). This fork implements that with Slack Incoming Webhooks. **Not** Freqtrade’s built-in Telegram.
 
 1. In Slack: **Apps → Incoming Webhooks** → add to your channel → copy webhook URL.
 2. On the server, set the secret (preferred — keep out of git):
@@ -59,7 +78,7 @@ Uses the same `OrderManager` hooks as the legacy Telegram bot (`notify_order_fil
 0 0 * * * cd ~/freqtrade && docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/daily_summary_slack.py
 ```
 
-To match your old Telegram formatting exactly, copy message text from your legacy `telegram_notifier.py` into `spot_ladder/slack_notifier.py` (method bodies only — call sites stay the same).
+To customize message text, edit method bodies in `spot_ladder/slack_notifier.py` (call sites in `order_manager.py` stay unchanged).
 
 ## Stay current with upstream freqtrade
 
