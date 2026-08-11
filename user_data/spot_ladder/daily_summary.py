@@ -128,11 +128,22 @@ def calculate_average_entry_from_stored_orders(
     return (avg, total_amount, scaled_cost)
 
 
-def _active_lifo_queue(buy_orders: list[dict]) -> list[dict]:
+def _active_lifo_queue(
+    buy_orders: list[dict],
+    *,
+    sell_timestamp: str | None = None,
+) -> list[dict]:
+    """LIFO queue of unconsumed buy lots, optionally limited to fills before a sell."""
+    sell_dt = _parse_ts(sell_timestamp) if sell_timestamp else None
     queue: list[dict] = []
     for row in buy_orders:
         if row.get("fully_consumed"):
             continue
+        buy_ts = row.get("fill_timestamp") or ""
+        if sell_dt and buy_ts:
+            buy_dt = _parse_ts(buy_ts)
+            if buy_dt and buy_dt >= sell_dt:
+                continue
         amount = float(row.get("amount", 0))
         consumed = float(row.get("consumed_amount", 0))
         remaining = amount - consumed
@@ -141,7 +152,7 @@ def _active_lifo_queue(buy_orders: list[dict]) -> list[dict]:
                 {
                     "rate": float(row.get("rate", 0)),
                     "remaining": remaining,
-                    "fill_timestamp": row.get("fill_timestamp", ""),
+                    "fill_timestamp": buy_ts,
                 }
             )
     queue.sort(key=lambda x: x.get("fill_timestamp", ""), reverse=True)
@@ -223,7 +234,7 @@ def _replay_sell_profits(
 
     results: list[tuple[dict, float]] = []
     for sell in sorted(sell_orders, key=lambda s: s.get("fill_timestamp") or ""):
-        queue = _active_lifo_queue(buys)
+        queue = _active_lifo_queue(buys, sell_timestamp=sell.get("fill_timestamp") or "")
         profit, _ = _lifo_match_profit(
             queue,
             float(sell.get("amount", 0)),
