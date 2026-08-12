@@ -70,7 +70,7 @@ trading:
       - 2.25
       - 2.5
       - 2.75
-    cancel_working_threshold_pct: 10.0
+    cancel_working_threshold_pct: 5.0
     working_price_update_threshold: 3.0
 
   order_size_distribution: weighted
