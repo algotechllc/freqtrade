@@ -5,8 +5,8 @@ Seed price_high_{COIN}.json with 180 days of history for price_elevation.
 Without this, elevation stays neutral (100% deploy) until live samples accumulate,
 so a high-price flatten would still fill the whole buy ladder.
 
-Uses Binance XRPUSDT 4h closes (USD-pegged; close enough to Hyperliquid XRP/USDC
-for percentile ranking). Optional --source hyperliquid uses CCXT if available.
+Default source is Hyperliquid (same venue as the bot). Other public APIs are tried
+if that fails — Binance often returns HTTP 451 from restricted regions.
 
 Run on the server (inside the freqtrade container):
 
@@ -23,16 +23,19 @@ import argparse
 import json
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import yaml
 
 USER_DATA = Path(__file__).resolve().parents[1]
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+UA = {"User-Agent": "spot-ladder-seed/1.0"}
+
+PriceSeries = List[Tuple[float, float]]
 
 
 def _load_ladder_config() -> dict:
@@ -40,23 +43,117 @@ def _load_ladder_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _fetch_binance_4h(symbol: str, days: int) -> List[Tuple[float, float]]:
-    """Return (unix_seconds, close) for `days` of 4h candles."""
+def _http_json(url: str, data: bytes | None = None, headers: dict | None = None, timeout: int = 30):
+    hdrs = {**UA, **(headers or {})}
+    req = urllib.request.Request(url, data=data, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _dedupe(rows: PriceSeries) -> PriceSeries:
+    return sorted({t: p for t, p in rows}.items())
+
+
+def _fetch_hyperliquid(coin: str, days: int) -> PriceSeries:
+    """Native Hyperliquid candleSnapshot (perp coin id, e.g. XRP)."""
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - days * 24 * 3600 * 1000
-    out: List[Tuple[float, float]] = []
+    payload = json.dumps({
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": "4h",
+            "startTime": start_ms,
+            "endTime": end_ms,
+        },
+    }).encode()
+    rows = _http_json(
+        "https://api.hyperliquid.xyz/info",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    if not isinstance(rows, list):
+        raise RuntimeError(f"unexpected Hyperliquid response: {type(rows).__name__}")
+    out: PriceSeries = []
+    for row in rows:
+        ts_ms = int(row.get("t") or 0)
+        close = float(row.get("c") or 0)
+        if ts_ms > 0 and close > 0:
+            out.append((ts_ms / 1000.0, close))
+    return _dedupe(out)
+
+
+def _fetch_kraken(coin: str, days: int) -> PriceSeries:
+    pair = f"{coin}USD"
+    url = "https://api.kraken.com/0/public/OHLC?" + urllib.parse.urlencode({
+        "pair": pair,
+        "interval": 240,
+    })
+    data = _http_json(url)
+    errors = data.get("error") or []
+    if errors:
+        raise RuntimeError(f"Kraken error: {errors}")
+    result = data.get("result") or {}
+    key = next((k for k in result if k != "last"), None)
+    if not key:
+        raise RuntimeError("Kraken: no OHLC series")
+    cutoff = time.time() - days * 24 * 3600
+    out: PriceSeries = []
+    for row in result[key]:
+        ts = float(row[0])
+        close = float(row[4])
+        if ts >= cutoff and close > 0:
+            out.append((ts, close))
+    return _dedupe(out)
+
+
+def _fetch_bybit(coin: str, days: int) -> PriceSeries:
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - days * 24 * 3600 * 1000
+    out: PriceSeries = []
+    page_end = end_ms
+    for _ in range(4):
+        params = urllib.parse.urlencode({
+            "category": "linear",
+            "symbol": f"{coin}USDT",
+            "interval": "240",
+            "start": start_ms,
+            "end": page_end,
+            "limit": 1000,
+        })
+        data = _http_json(f"https://api.bybit.com/v5/market/kline?{params}")
+        if int(data.get("retCode") or 0) != 0:
+            raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
+        rows = ((data.get("result") or {}).get("list") or [])
+        if not rows:
+            break
+        for row in rows:
+            ts_ms = int(row[0])
+            close = float(row[4])
+            if close > 0:
+                out.append((ts_ms / 1000.0, close))
+        oldest_ms = min(int(r[0]) for r in rows)
+        if oldest_ms <= start_ms or len(rows) < 1000:
+            break
+        page_end = oldest_ms - 1
+        time.sleep(0.15)
+    return _dedupe(out)
+
+
+def _fetch_binance(coin: str, days: int) -> PriceSeries:
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - days * 24 * 3600 * 1000
+    out: PriceSeries = []
     cursor = start_ms
     while cursor < end_ms:
         params = urllib.parse.urlencode({
-            "symbol": symbol,
+            "symbol": f"{coin}USDT",
             "interval": "4h",
             "startTime": cursor,
             "endTime": end_ms,
             "limit": 1000,
         })
-        url = f"{BINANCE_KLINES}?{params}"
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            rows = json.loads(resp.read().decode())
+        rows = _http_json(f"https://api.binance.com/api/v3/klines?{params}")
         if not rows:
             break
         for row in rows:
@@ -71,38 +168,46 @@ def _fetch_binance_4h(symbol: str, days: int) -> List[Tuple[float, float]]:
         if len(rows) < 1000:
             break
         time.sleep(0.2)
-    # Deduplicate by timestamp, keep last
-    by_ts = {t: p for t, p in out}
-    return sorted(by_ts.items())
+    return _dedupe(out)
 
 
-def _fetch_hyperliquid(ccxt_pair: str, days: int) -> List[Tuple[float, float]]:
-    import ccxt  # type: ignore
+SOURCES: dict[str, Callable[[str, int], PriceSeries]] = {
+    "hyperliquid": _fetch_hyperliquid,
+    "kraken": _fetch_kraken,
+    "bybit": _fetch_bybit,
+    "binance": _fetch_binance,
+}
+AUTO_ORDER = ("hyperliquid", "kraken", "bybit", "binance")
 
-    ex = ccxt.hyperliquid({"enableRateLimit": True})
-    since = int((time.time() - days * 24 * 3600) * 1000)
-    candles = []
-    cursor = since
-    while True:
-        batch = ex.fetch_ohlcv(ccxt_pair, timeframe="4h", since=cursor, limit=500)
-        if not batch:
-            break
-        candles.extend(batch)
-        nxt = int(batch[-1][0]) + 4 * 3600 * 1000
-        if nxt <= cursor or len(batch) < 2:
-            break
-        cursor = nxt
-        if cursor > int(time.time() * 1000):
-            break
-    by_ts = {int(c[0]) / 1000.0: float(c[4]) for c in candles}
-    return sorted(by_ts.items())
+
+def _try_source(name: str, coin: str, days: int) -> Optional[PriceSeries]:
+    fetch = SOURCES[name]
+    print(f"Fetching {days}d of {coin} 4h closes from {name}…")
+    try:
+        prices = fetch(coin, days)
+    except urllib.error.HTTPError as e:
+        hint = " (geo-blocked — trying next source)" if e.code == 451 else ""
+        print(f"  {name} failed: HTTP {e.code}{hint}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"  {name} failed: {e}", file=sys.stderr)
+        return None
+    if len(prices) < 10:
+        print(f"  {name} returned only {len(prices)} samples — trying next source", file=sys.stderr)
+        return None
+    return prices
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Seed price_elevation history JSON")
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--coin", default="")
-    parser.add_argument("--source", choices=("binance", "hyperliquid"), default="binance")
+    parser.add_argument(
+        "--source",
+        choices=("auto", *SOURCES.keys()),
+        default="auto",
+        help="auto tries Hyperliquid first, then Kraken/Bybit/Binance",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -119,19 +224,18 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     out_path = state_dir / f"price_high_{cointype}.json"
 
-    ccxt_pair = (cfg.get("ccxt_pairs") or {}).get(symbol, f"{cointype}/USDC:USDC")
-    binance_symbol = f"{cointype}USDT"
-
-    print(f"Fetching {days}d of {cointype} closes from {args.source}…")
-    if args.source == "hyperliquid":
-        prices = _fetch_hyperliquid(ccxt_pair, days)
-        source_label = f"Hyperliquid CCXT {ccxt_pair} 4h"
-    else:
-        prices = _fetch_binance_4h(binance_symbol, days)
-        source_label = f"Binance {binance_symbol} 4h (USD-pegged proxy for USDC)"
+    names = AUTO_ORDER if args.source == "auto" else (args.source,)
+    prices: PriceSeries = []
+    source_used = ""
+    for name in names:
+        got = _try_source(name, cointype, days)
+        if got:
+            prices = got
+            source_used = name
+            break
 
     if len(prices) < 10:
-        print(f"Too few samples ({len(prices)}). Refusing to write.", file=sys.stderr)
+        print("All sources failed. Refusing to write.", file=sys.stderr)
         return 1
 
     cutoff = time.time() - window_hours * 3600
@@ -145,6 +249,12 @@ def main() -> int:
     rolling_mean = sum(highs) / len(highs)
     span_days = (entries[-1]["timestamp"] - entries[0]["timestamp"]) / 86400.0
     now = datetime.now(timezone.utc).isoformat()
+    labels = {
+        "hyperliquid": f"Hyperliquid {cointype} perp 4h",
+        "kraken": f"Kraken {cointype}USD 4h",
+        "bybit": f"Bybit {cointype}USDT perp 4h",
+        "binance": f"Binance {cointype}USDT 4h",
+    }
 
     data = {
         "symbol": f"{cointype}/USDC",
@@ -156,10 +266,11 @@ def main() -> int:
         "price_history": entries,
         "seeded": True,
         "seeded_at": now,
-        "data_source": source_label,
+        "data_source": labels.get(source_used, source_used),
         "real_historical_data": True,
     }
 
+    print(f"  source: {source_used}")
     print(f"  samples: {len(entries)} over {span_days:.0f}d")
     print(f"  range: ${rolling_low:.4f} – ${rolling_high:.4f} (mean ${rolling_mean:.4f})")
     print(f"  file: {out_path}")
