@@ -80,6 +80,7 @@ class OrderManager:
         self.small_position_threshold = config['trading'].get('small_position_threshold', 999.0)  # Default 999 (effectively disabled)
         self.increased_capital_threshold = config['trading'].get('increased_capital_threshold', 500.0)  # Default $500
         self.increased_capital_observation_period = config['trading'].get('increased_capital_observation_period', 3600)  # Default 1 hour in seconds
+        self.max_buy_ladder_usdc = float(config['trading'].get('max_buy_ladder_usdc', 0) or 0)  # 0 = unlimited
         
         # Trading fees
         self.buy_fee = config['trading'].get('buy_fee_percentage', 0.01)  # Default 1%
@@ -159,16 +160,18 @@ class OrderManager:
         # Price elevation tracking for capital preservation during high prices
         self.price_elevation_config = config.get('price_elevation', {})
         self.price_elevation_enabled = self.price_elevation_config.get('enabled', False)
-        self.price_elevation_window_hours = self.price_elevation_config.get('window_hours', 2160)  # 90 days default
+        self.price_elevation_window_hours = self.price_elevation_config.get('window_hours', 4320)  # 180 days default
         # Mean-reversion tiers matched by max_percentile (upper percentile bound).
         # Cheaper (lower percentile) = more aggressive (higher allocation, fewer skips).
         self.price_elevation_tiers = self.price_elevation_config.get('tiers', [
             {'max_percentile': 20, 'allocation': 100, 'skip_levels': 0},
             {'max_percentile': 40, 'allocation': 85, 'skip_levels': 0},
-            {'max_percentile': 60, 'allocation': 70, 'skip_levels': 1},
-            {'max_percentile': 80, 'allocation': 55, 'skip_levels': 2},
-            {'max_percentile': 100, 'allocation': 40, 'skip_levels': 3},
+            {'max_percentile': 60, 'allocation': 65, 'skip_levels': 1},
+            {'max_percentile': 80, 'allocation': 40, 'skip_levels': 1},
+            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 0},
         ])
+        self._load_position_aware_config()
+        self._load_entry_aware_config()
         self.rolling_price_high = 0.0  # Highest price in the window (context/logging)
         self.rolling_price_low = 0.0  # Lowest price in the window (context/logging)
         self.rolling_price_mean = 0.0  # Mean price in the window (fair-value reference)
@@ -178,6 +181,9 @@ class OrderManager:
             self._state_dir, f"price_high_{self.cointype}.json"
         )  # Persist price history across restarts
         self._price_high_save_counter = 0  # Counter for periodic saves
+        self._price_high_file_metadata: Dict = {}
+        if self.price_elevation_enabled:
+            self._init_price_high_from_disk()
         
         # Skim functionality
         self.skim_config = config.get('skim', {})
@@ -262,6 +268,7 @@ class OrderManager:
         self.small_position_threshold = config['trading'].get('small_position_threshold', 999.0)
         self.increased_capital_threshold = config['trading'].get('increased_capital_threshold', 500.0)
         self.increased_capital_observation_period = config['trading'].get('increased_capital_observation_period', 3600)
+        self.max_buy_ladder_usdc = float(config['trading'].get('max_buy_ladder_usdc', 0) or 0)
         
         # Update trading fees
         self.buy_fee = config['trading'].get('buy_fee_percentage', 0.01)
@@ -279,14 +286,18 @@ class OrderManager:
         # Update price elevation settings
         self.price_elevation_config = config.get('price_elevation', {})
         self.price_elevation_enabled = self.price_elevation_config.get('enabled', False)
-        self.price_elevation_window_hours = self.price_elevation_config.get('window_hours', 2160)
+        self.price_elevation_window_hours = self.price_elevation_config.get('window_hours', 4320)
         self.price_elevation_tiers = self.price_elevation_config.get('tiers', [
             {'max_percentile': 20, 'allocation': 100, 'skip_levels': 0},
             {'max_percentile': 40, 'allocation': 85, 'skip_levels': 0},
-            {'max_percentile': 60, 'allocation': 70, 'skip_levels': 1},
-            {'max_percentile': 80, 'allocation': 55, 'skip_levels': 2},
-            {'max_percentile': 100, 'allocation': 40, 'skip_levels': 3},
+            {'max_percentile': 60, 'allocation': 65, 'skip_levels': 1},
+            {'max_percentile': 80, 'allocation': 40, 'skip_levels': 1},
+            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 0},
         ])
+        self._load_position_aware_config()
+        self._load_entry_aware_config()
+        if self.price_elevation_enabled and not self.price_high_history:
+            self._init_price_high_from_disk()
         
         # Update skim settings
         self.skim_config = config.get('skim', {})
@@ -2481,19 +2492,109 @@ class OrderManager:
     def _get_price_high_file_path(self) -> str:
         """Get the full path to the price high tracking file"""
         return self._price_elevation_file
+
+    def _normalize_price_history_timestamp(self, ts: float) -> float:
+        """Normalize persisted timestamps to Unix seconds (handles ms or str from JSON)."""
+        if isinstance(ts, str):
+            ts = float(ts)
+        ts = float(ts)
+        if ts > 1e12:
+            ts /= 1000.0
+        return ts
+
+    def _filter_price_history_to_window(
+        self, history: List[Tuple[float, float]], cutoff_time: float
+    ) -> List[Tuple[float, float]]:
+        return [(t, p) for t, p in history if t >= cutoff_time]
+
+    def _recompute_rolling_price_stats(self):
+        """Recompute rolling high/low/mean from price_high_history (percentile needs current_price)."""
+        if not self.price_high_history:
+            return
+        prices = [p for _, p in self.price_high_history]
+        n = len(prices)
+        self.rolling_price_high = max(prices)
+        self.rolling_price_low = min(prices)
+        self.rolling_price_mean = sum(prices) / n
+        if self.current_price > 0:
+            below = sum(1 for p in prices if p < self.current_price)
+            self.price_percentile = (below / n) * 100.0
+
+    def _init_price_high_from_disk(self):
+        """Load price distribution from disk at startup so restarts never start from a blank window."""
+        file_path = self._get_price_high_file_path()
+        cutoff_time = time.time() - self.price_elevation_window_hours * 3600
+        raw_count = 0
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                self._price_high_file_metadata = {
+                    k: data.get(k)
+                    for k in ('seeded', 'seeded_at', 'data_source', 'real_historical_data')
+                    if data.get(k) is not None
+                }
+                parsed = [
+                    (self._normalize_price_history_timestamp(e['timestamp']), float(e['price']))
+                    for e in data.get('price_history', [])
+                ]
+                raw_count = len(parsed)
+                self.price_high_history = self._filter_price_history_to_window(parsed, cutoff_time)
+                if raw_count >= self._MIN_PERCENTILE_SAMPLES and len(self.price_high_history) < self._MIN_PERCENTILE_SAMPLES:
+                    ts_min = min(t for t, _ in parsed)
+                    ts_max = max(t for t, _ in parsed)
+                    logging.warning(
+                        f"{self.symbol}: Price history window filter kept only "
+                        f"{len(self.price_high_history)}/{raw_count} entries from {file_path} "
+                        f"(cutoff {datetime.utcfromtimestamp(cutoff_time).strftime('%Y-%m-%d')}, "
+                        f"file ts range {datetime.utcfromtimestamp(ts_min).strftime('%Y-%m-%d')} – "
+                        f"{datetime.utcfromtimestamp(ts_max).strftime('%Y-%m-%d')}). "
+                        f"Re-run spot_ladder/fetch_historical_prices.py --days "
+                        f"{int(self.price_elevation_window_hours / 24)}"
+                    )
+            except Exception as e:
+                logging.warning(f"{self.symbol}: Could not load price high history from {file_path}: {e}")
+        else:
+            logging.warning(
+                f"{self.symbol}: No price history file at {file_path} — elevation percentile will be "
+                f"neutral until samples accumulate or you run fetch_historical_prices.py"
+            )
+
+        if self.price_high_history:
+            self._recompute_rolling_price_stats()
+            oldest_ts = min(t for t, _ in self.price_high_history)
+            span_days = (time.time() - oldest_ts) / 86400.0
+            logging.info(
+                f"{self.symbol}: Loaded price elevation history: {len(self.price_high_history)} samples "
+                f"over {span_days:.0f}d from {file_path} "
+                f"(rolling high ${self.rolling_price_high:.4f})"
+            )
+        elif raw_count > 0:
+            logging.warning(
+                f"{self.symbol}: Price history file had {raw_count} entries but none within the "
+                f"{self.price_elevation_window_hours / 24:.0f}d window — re-backfill recommended"
+            )
     
     def _load_price_high_history(self) -> List[Tuple[float, float]]:
-        """Load price high history from JSON file for persistence across restarts"""
+        """Load price high history from JSON file (used if startup load was skipped)."""
         file_path = self._get_price_high_file_path()
         if os.path.exists(file_path):
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
-                    history = data.get('price_history', [])
-                    # Convert to list of tuples
-                    return [(entry['timestamp'], entry['price']) for entry in history]
+                self._price_high_file_metadata = {
+                    k: data.get(k)
+                    for k in ('seeded', 'seeded_at', 'data_source', 'real_historical_data')
+                    if data.get(k) is not None
+                }
+                cutoff_time = time.time() - self.price_elevation_window_hours * 3600
+                parsed = [
+                    (self._normalize_price_history_timestamp(e['timestamp']), float(e['price']))
+                    for e in data.get('price_history', [])
+                ]
+                return self._filter_price_history_to_window(parsed, cutoff_time)
             except Exception as e:
-                logging.debug(f"{self.symbol}: Could not load price high history: {e}")
+                logging.warning(f"{self.symbol}: Could not load price high history: {e}")
         return []
     
     def _save_price_high_history(self):
@@ -2501,6 +2602,27 @@ class OrderManager:
         file_path = self._get_price_high_file_path()
         try:
             history = [{'timestamp': t, 'price': p} for t, p in self.price_high_history]
+            new_count = len(history)
+
+            existing_count = 0
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r') as f:
+                        existing_data = json.load(f)
+                    existing_count = len(existing_data.get('price_history', []))
+                    for key in ('seeded', 'seeded_at', 'data_source', 'real_historical_data'):
+                        if existing_data.get(key) is not None:
+                            self._price_high_file_metadata[key] = existing_data.get(key)
+                except Exception:
+                    pass
+
+            if existing_count >= 50 and new_count < max(10, int(existing_count * 0.25)):
+                logging.error(
+                    f"{self.symbol}: Refusing to save price history ({new_count} samples) — would "
+                    f"overwrite {existing_count} entries in {file_path}. Re-run fetch_historical_prices.py"
+                )
+                return
+
             data = {
                 'symbol': self.symbol,
                 'last_updated': datetime.utcnow().isoformat(),
@@ -2509,8 +2631,9 @@ class OrderManager:
                 'rolling_mean': self.rolling_price_mean,
                 'price_percentile': self.price_percentile,
                 'window_hours': self.price_elevation_window_hours,
-                'price_history': history
+                'price_history': history,
             }
+            data.update(self._price_high_file_metadata)
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
@@ -2537,8 +2660,8 @@ class OrderManager:
         if current_price <= 0:
             return
         
-        # Load persisted history on first call
-        if not self.price_high_history:
+        # Load persisted history on first call (normally already loaded at startup)
+        if not self.price_high_history and not self._price_high_file_metadata:
             self.price_high_history = self._load_price_high_history()
         
         # Add current price to history
@@ -2548,8 +2671,13 @@ class OrderManager:
         window_seconds = self.price_elevation_window_hours * 3600
         cutoff_time = current_time - window_seconds
         
-        # Remove old entries outside the window
-        self.price_high_history = [(t, p) for t, p in self.price_high_history if t >= cutoff_time]
+        before_filter = len(self.price_high_history)
+        self.price_high_history = self._filter_price_history_to_window(self.price_high_history, cutoff_time)
+        if before_filter >= self._MIN_PERCENTILE_SAMPLES and len(self.price_high_history) < self._MIN_PERCENTILE_SAMPLES:
+            logging.warning(
+                f"{self.symbol}: Price history dropped to {len(self.price_high_history)} samples "
+                f"after window filter (had {before_filter}) — check {self._get_price_high_file_path()}"
+            )
         
         if not self.price_high_history:
             return
@@ -2637,6 +2765,201 @@ class OrderManager:
             'position_pct': position_pct,
             'tier_name': 'most conservative'
         }
+
+    def _load_position_aware_config(self):
+        """Load position-aware buy allocation settings from price_elevation.position_aware."""
+        pa_config = self.price_elevation_config.get('position_aware', {})
+        self.position_aware_enabled = pa_config.get('enabled', False)
+        self.position_aware_low_token_pct = pa_config.get('low_token_threshold_pct', 30.0)
+        self.position_aware_high_token_pct = pa_config.get('high_token_threshold_pct', 70.0)
+        self.position_aware_boost_allocation_pct = pa_config.get('boost_allocation_pct', 75.0)
+        self.position_aware_max_boost_percentile = pa_config.get('max_boost_percentile', 80.0)
+        if self.position_aware_max_boost_percentile >= 100:
+            logging.warning(
+                f"{self.symbol}: position_aware max_boost_percentile must be < 100 — using 80"
+            )
+            self.position_aware_max_boost_percentile = 80.0
+        if self.position_aware_high_token_pct <= self.position_aware_low_token_pct:
+            logging.warning(
+                f"{self.symbol}: position_aware high_token_threshold_pct must exceed "
+                f"low_token_threshold_pct — disabling position-aware allocation"
+            )
+            self.position_aware_enabled = False
+
+    def _get_portfolio_token_pct(self) -> Optional[float]:
+        """Token value as % of total symbol portfolio (coins + quote)."""
+        if self.current_price <= 0 or self.balance_percentage <= 0:
+            return None
+        coin_value = self.coin_balance * self.current_price
+        quote_balance = self.available_balance / self.balance_percentage
+        total = coin_value + quote_balance
+        if total <= 0:
+            return None
+        return (coin_value / total) * 100.0
+
+    def _load_entry_aware_config(self):
+        """Load entry-aware buy allocation floor from price_elevation.entry_aware."""
+        ea_config = self.price_elevation_config.get('entry_aware', {})
+        self.entry_aware_enabled = ea_config.get('enabled', False)
+        self.entry_aware_min_discount_pct = ea_config.get('min_discount_pct', 15.0)
+        self.entry_aware_allocation_floor_pct = ea_config.get('allocation_floor_pct', 50.0)
+        self.entry_aware_extra_per_10_pct = ea_config.get('extra_per_10_pct_below', 5.0)
+        self.entry_aware_max_allocation_pct = ea_config.get('max_allocation_pct', 65.0)
+
+    def _get_entry_aware_allocation_floor(self) -> float:
+        """Minimum buy allocation when price is materially below average entry (recovery context)."""
+        if not self.entry_aware_enabled:
+            return 0.0
+        if self.average_entry_price <= 0 or self.current_price <= 0:
+            return 0.0
+        discount_pct = (
+            (self.average_entry_price - self.current_price) / self.average_entry_price * 100.0
+        )
+        if discount_pct < self.entry_aware_min_discount_pct:
+            return 0.0
+        extra_pct = discount_pct - self.entry_aware_min_discount_pct
+        floor = self.entry_aware_allocation_floor_pct + (
+            extra_pct / 10.0 * self.entry_aware_extra_per_10_pct
+        )
+        return min(self.entry_aware_max_allocation_pct, floor)
+
+    def _get_effective_buy_allocation_pct(self, elevation_allocation_pct: float, percentile: float = 0.0) -> float:
+        """Blend price-elevation allocation with position-aware boost when underweight tokens.
+
+        Boost is scaled down at elevated percentiles so cash-heavy portfolios are not pushed
+        to commit heavily while price is still expensive vs the rolling window (avoids filling
+        a large ladder on the way down from a local high).
+
+        Entry-aware floor applies after blending: underwater vs avg entry overrides local-high
+        conservatism (recovery buys are still attractive even at a rolling-window high).
+        """
+        effective = elevation_allocation_pct
+        if self.position_aware_enabled:
+            token_pct = self._get_portfolio_token_pct()
+            if token_pct is not None:
+                low = self.position_aware_low_token_pct
+                high = self.position_aware_high_token_pct
+                boost = self.position_aware_boost_allocation_pct
+                max_boost_pct = self.position_aware_max_boost_percentile
+
+                if token_pct <= low:
+                    target = max(elevation_allocation_pct, boost)
+                elif token_pct >= high:
+                    target = elevation_allocation_pct
+                else:
+                    blend = (token_pct - low) / (high - low)
+                    cash_heavy = max(elevation_allocation_pct, boost)
+                    target = cash_heavy * (1 - blend) + elevation_allocation_pct * blend
+
+                fade_end = 99.5
+                if percentile <= max_boost_pct:
+                    boost_factor = 1.0
+                elif percentile >= fade_end or max_boost_pct >= fade_end:
+                    boost_factor = 0.0
+                else:
+                    boost_factor = max(0.0, (fade_end - percentile) / (fade_end - max_boost_pct))
+
+                effective = elevation_allocation_pct + (target - elevation_allocation_pct) * boost_factor
+
+        entry_floor = self._get_entry_aware_allocation_floor()
+        if entry_floor > effective:
+            effective = entry_floor
+        return min(100.0, max(0.0, effective))
+
+    def _apply_buy_ladder_quote_cap(self, amount: float) -> float:
+        """Cap total buy-ladder deployment in quote (0 = no cap)."""
+        if self.max_buy_ladder_usdc <= 0:
+            return amount
+        return min(amount, self.max_buy_ladder_usdc)
+
+    def _gross_buy_deployable(self) -> float:
+        """Quote available for buy-ladder deployment after fee buffer (before allocation % or cap)."""
+        if self.available_balance <= 0:
+            return 0.0
+        return (self.available_balance / (1.0 + self.buy_fee)) * 0.99
+
+    def _intended_buy_committed(self, allocation_pct: float) -> float:
+        """Quote the buy ladder is supposed to commit at the current allocation.
+
+        Elevation/position-aware allocation only applies when sizing orders — it does
+        not reduce available_balance. Callers must not treat the leftover as unused capital.
+        Applies max_buy_ladder_usdc when configured.
+        """
+        if self.available_balance <= 0:
+            return 0.0
+        deploy_pct = min(100.0, max(0.0, allocation_pct)) / 100.0
+        amount = self._gross_buy_deployable() * deploy_pct
+        return self._apply_buy_ladder_quote_cap(amount)
+
+    def _log_buy_deployment_summary(
+        self,
+        allocation_pct: float,
+        elevation_allocation_pct: float,
+        existing_buy_committed: float,
+        existing_order_count: int,
+        needed_orders: int,
+        skip_levels: int = 0,
+    ):
+        """One-place summary of how allocation %, entry floor, and quote cap set ladder size."""
+        gross = self._gross_buy_deployable()
+        at_pct = gross * (allocation_pct / 100.0)
+        intended = self._intended_buy_committed(allocation_pct)
+        entry_floor = self._get_entry_aware_allocation_floor()
+        portfolio_token_pct = self._get_portfolio_token_pct()
+
+        chain_parts = [f"elevation tier {elevation_allocation_pct:.0f}%"]
+        if entry_floor > elevation_allocation_pct:
+            if self.average_entry_price > 0 and self.current_price > 0:
+                disc = (self.average_entry_price - self.current_price) / self.average_entry_price * 100.0
+                chain_parts.append(
+                    f"entry floor {entry_floor:.0f}% ({disc:.0f}% below entry ${self.average_entry_price:.4f})"
+                )
+            else:
+                chain_parts.append(f"entry floor {entry_floor:.0f}%")
+            chain_parts.append(f"effective {allocation_pct:.0f}%")
+        if (self.position_aware_enabled
+                and portfolio_token_pct is not None
+                and allocation_pct != elevation_allocation_pct
+                and allocation_pct != entry_floor):
+            chain_parts.append(
+                f"position-aware → {allocation_pct:.0f}% (tokens {portfolio_token_pct:.0f}% of portfolio)"
+            )
+        if allocation_pct == elevation_allocation_pct and entry_floor <= elevation_allocation_pct:
+            chain_parts.append(f"effective {allocation_pct:.0f}%")
+
+        limit_parts = [f"{allocation_pct:.0f}% of ${gross:.0f} deployable → ${at_pct:.0f}"]
+        if self.max_buy_ladder_usdc > 0:
+            if intended < at_pct - 0.5:
+                limit_parts.append(f"cap ${self.max_buy_ladder_usdc:.0f} binding → ${intended:.0f} ladder")
+            else:
+                limit_parts.append(f"cap ${self.max_buy_ladder_usdc:.0f} (not binding)")
+        else:
+            limit_parts.append(f"→ ${intended:.0f} ladder target")
+
+        intentional_reserve = max(0.0, self.available_balance - intended)
+        deployable_gap = intended - existing_buy_committed
+        if existing_buy_committed > intended + self.increased_capital_threshold:
+            gap_label = f"OVER by ${existing_buy_committed - intended:.0f}"
+        elif abs(deployable_gap) <= self.increased_capital_threshold:
+            gap_label = "at target"
+        else:
+            gap_label = f"room to add ${deployable_gap:.0f}"
+
+        levels_note = f"{needed_orders} levels"
+        if skip_levels > 0:
+            levels_note += f" (skip {skip_levels} shallow)"
+
+        self._info(
+            f"{self.symbol}: Buy deployment summary\n"
+            f"  orders: {existing_order_count}/{needed_orders} ({levels_note})\n"
+            f"  balance: ${self.available_balance / self.balance_percentage:.0f} base → "
+            f"${self.available_balance:.0f} available ({self.balance_percentage * 100:.0f}% slice)\n"
+            f"  allocation: {' → '.join(chain_parts)}\n"
+            f"  ladder $: {'; '.join(limit_parts)}\n"
+            f"  committed: ${existing_buy_committed:.0f} | "
+            f"intentional reserve: ${intentional_reserve:.0f} | "
+            f"gap: ${deployable_gap:+.0f} ({gap_label})"
+        )
         
     def update_balances(self, balances: Dict):
         """Update available balances for this symbol"""
@@ -3471,22 +3794,42 @@ class OrderManager:
         #
         elevation_tier = self._get_price_elevation_tier()
         skip_levels = elevation_tier.get('skip_levels', 0)
-        allocation_pct = elevation_tier.get('allocation', 100)
+        elevation_allocation_pct = elevation_tier.get('allocation', 100)
         percentile = elevation_tier.get('percentile', 0)
         position_pct = elevation_tier.get('position_pct', 0)
         tier_name = elevation_tier.get('tier_name', 'disabled')
+        allocation_pct = self._get_effective_buy_allocation_pct(
+            elevation_allocation_pct if self.price_elevation_enabled else 100.0,
+            percentile=percentile,
+        )
+        portfolio_token_pct = self._get_portfolio_token_pct()
         
-        # Log price elevation status if enabled
+        # Log price elevation signal (percentile / rolling window); dollar limits in deployment summary
         if self.price_elevation_enabled and self.rolling_price_high > 0:
             window_days = self.price_elevation_window_hours / 24
-            self._info(f"{self.symbol}: Price Elevation Protection (buy allocation):\n"
-                        f"  {window_days:.0f}-day range: ${self.rolling_price_low:.4f} - ${self.rolling_price_high:.4f} (mean ${self.rolling_price_mean:.4f})\n"
+            coverage_log = ""
+            if self.price_high_history:
+                oldest_ts = min(t for t, _ in self.price_high_history)
+                span_days = (time.time() - oldest_ts) / 86400.0
+                coverage_log = (
+                    f"  samples: {len(self.price_high_history)} over {span_days:.0f}d "
+                    f"(configured window: {window_days:.0f}d)\n"
+                )
+                if span_days < window_days * 0.85:
+                    coverage_log += (
+                        f"  ⚠️ history shorter than window — run "
+                        f"spot_ladder/fetch_historical_prices.py --days {int(window_days)} to backfill\n"
+                    )
+            self._info(f"{self.symbol}: Price elevation (percentile signal):\n"
+                        f"{coverage_log}"
+                        f"  rolling range: ${self.rolling_price_low:.4f} - ${self.rolling_price_high:.4f} (mean ${self.rolling_price_mean:.4f})\n"
                         f"  current price: ${self.current_price:.4f}\n"
                         f"  percentile: {percentile:.1f}th (0=cheapest, 100=most expensive)\n"
                         f"  {position_pct:.1f}% below rolling high\n"
-                        f"  tier: {tier_name}\n"
-                        f"  allocation: {allocation_pct}% of balance\n"
-                        f"  skip_levels: {skip_levels} shallowest levels")
+                        f"  tier: {tier_name} ({elevation_allocation_pct:.0f}% tier alloc) | skip_levels: {skip_levels}")
+        elif self.position_aware_enabled and portfolio_token_pct is not None and allocation_pct != elevation_allocation_pct:
+            self._info(f"{self.symbol}: Position-aware allocation: {allocation_pct:.0f}% "
+                        f"(elevation {elevation_allocation_pct:.0f}%, tokens {portfolio_token_pct:.0f}% of portfolio)")
         
         # CRITICAL: Always fetch fresh orders from API before processing
         # This ensures we're working with actual API state, not stale internal tracking
@@ -3570,13 +3913,10 @@ class OrderManager:
         
         # Calculate committed quote in buy orders
         existing_buy_committed = sum(order.amount * order.rate for order in existing_buy_orders)
+        intended_buy_committed = self._intended_buy_committed(allocation_pct)
         
         # Calculate uncommitted balance for logging
         uncommitted_balance = self.available_balance - existing_buy_committed
-        
-        # Log buy ladder check status (similar to sell ladder)
-        # Show total base balance and percentage used for clarity
-        base_balance = self.available_balance / self.balance_percentage if self.balance_percentage > 0 else 0
         
         # Calculate price change from when orders were placed
         # If we have existing orders but no tracking price, estimate from highest buy order
@@ -3585,7 +3925,7 @@ class OrderManager:
             # Find the highest priced buy order
             highest_order_price = max(order.rate for order in existing_buy_orders)
             # Estimate the placement price (highest order is at shallowest level, typically 1% below)
-            shallowest_level = self.buy_levels[0] if self.buy_levels else 1.0
+            shallowest_level = effective_levels[0] if effective_levels else (self.buy_levels[0] if self.buy_levels else 1.0)
             estimated_placement_price = highest_order_price / (1 - shallowest_level / 100)
             self.price_when_orders_placed = estimated_placement_price
             self._info(f"{self.symbol}: Estimated placement price at ${estimated_placement_price:.4f} "
@@ -3595,19 +3935,19 @@ class OrderManager:
             change_pct = abs((self.current_price - self.price_when_orders_placed) / self.price_when_orders_placed) * 100
             remaining_pct = max(0, self.price_update_threshold - change_pct)
             direction = "↑" if self.current_price > self.price_when_orders_placed else "↓"
-            price_status = f"  price: {direction}{change_pct:.2f}% from placement (${self.price_when_orders_placed:.4f} → ${self.current_price:.4f}), need {remaining_pct:.2f}% more to recalc (threshold: {self.price_update_threshold}%)"
+            price_status = (
+                f"  price: {direction}{change_pct:.2f}% from placement "
+                f"(${self.price_when_orders_placed:.4f} → ${self.current_price:.4f}), "
+                f"need {remaining_pct:.2f}% more to recalc (threshold: {self.price_update_threshold}%)"
+            )
         else:
             price_status = f"  price: tracking from ${self.current_price:.4f}"
         
-        self._info(f"{self.symbol}: Buy Ladder Check\n"
-                    f"  existing: {len(existing_buy_orders)}\n"
-                    f"  needed: {needed_orders}\n"
-                    f"  base_balance: {base_balance:.2f} {self.market} (total)\n"
-                    f"  available ({self.balance_percentage*100:.0f}%): {self.available_balance:.2f} {self.market}\n"
-                    f"  committed: {existing_buy_committed:.2f} {self.market}\n"
-                    f"  uncommitted: {uncommitted_balance:.2f} {self.market}\n"
-                    f"  threshold: ${self.increased_capital_threshold:.2f}\n"
-                    f"{price_status}")
+        self._log_buy_deployment_summary(
+            allocation_pct, elevation_allocation_pct, existing_buy_committed,
+            len(existing_buy_orders), needed_orders, skip_levels,
+        )
+        self._info(f"{self.symbol}: Buy ladder timing\n{price_status}")
         
         # Check for over-commitment: buy orders using more quote than current allocation allows
         # This happens when buys fill (reducing quote balance) but remaining orders keep their old sizes,
@@ -3632,6 +3972,29 @@ class OrderManager:
             # Reset placement price so new orders use current price
             self.price_when_orders_placed = self.current_price
         
+        # Shrink ladder when committed exceeds intended (allocation % or max_buy_ladder_usdc cap)
+        if (len(existing_buy_orders) > 0
+                and existing_buy_committed > intended_buy_committed + self.increased_capital_threshold):
+            cap_note = (
+                f", cap ${self.max_buy_ladder_usdc:.0f}" if self.max_buy_ladder_usdc > 0 else ""
+            )
+            self._info(
+                f"{self.symbol}: Buy ladder OVER-SIZED — committed ${existing_buy_committed:.2f} exceeds "
+                f"intended ${intended_buy_committed:.2f}{cap_note}. Cancelling all orders to resize."
+            )
+            for order in existing_buy_orders:
+                try:
+                    self.api.cancel_order(order.order_id, order_type="buy")
+                    logging.debug(f"{self.symbol}: Cancelled oversized buy order {order.order_id}")
+                except Exception as e:
+                    logging.warning(f"{self.symbol}: Failed to cancel order {order.order_id}: {e}")
+            if existing_buy_orders:
+                time.sleep(0.5)
+            existing_buy_orders = []
+            existing_buy_committed = 0
+            uncommitted_balance = self.available_balance
+            self.price_when_orders_placed = self.current_price
+        
         if self.available_balance < self.min_order_size:
             if len(existing_buy_orders) == 0:
                 self._info(f"{self.symbol}: Insufficient balance for buy orders "
@@ -3653,121 +4016,88 @@ class OrderManager:
             # uncommitted_balance already calculated above
             needs_resize = False
             
-            # Check if available capital significantly exceeds committed capital (indicates orders need resizing)
-            # This handles cases where balance increased but orders weren't resized
-            # Uses dollar threshold instead of percentage (default $500)
-            has_excess_capital = uncommitted_balance > self.increased_capital_threshold
+            # Only treat uncommitted quote as "new capital" if it exceeds the elevation
+            # reserve. available_balance is the 90% symbol slice — it is NOT reduced by
+            # allocation_pct. At 20% deploy, ~80% idle is intentional dry powder.
+            intended_committed = self._intended_buy_committed(allocation_pct)
+            deployable_gap = intended_committed - existing_buy_committed
+            has_excess_capital = deployable_gap > self.increased_capital_threshold
             
             # Check if this is the first run (startup) - if so, bypass observation period
             # Only treat as first run if we have no tracking AND no existing orders
             is_first_run = old_buy_committed == 0 and len(existing_buy_orders) == 0
             
             if has_excess_capital:
-                # Calculate expected buffer and excess above it
-                # available_balance is ALREADY reduced by price elevation (e.g., 70% of total at Tier 3)
-                # So we only need the normal 5% order placement buffer
-                expected_buffer = self.available_balance * 0.05  # 5% buffer for order placement
-                excess_above_expected = uncommitted_balance - expected_buffer
                 unused_pct = (uncommitted_balance / self.available_balance) * 100 if self.available_balance > 0 else 0
+                elevation_reserve = max(0.0, self.available_balance - intended_committed)
                 
-                # On first run (startup), resize immediately if excess is significant (>10% unused)
-                # This handles cases where bot restarts with undersized orders
+                # On first run (startup), resize immediately if the deployable gap is large
                 if is_first_run:
-                    if unused_pct > 10.0 and excess_above_expected > self.increased_capital_threshold:
-                        # Significant excess capital (>10% unused) - resize immediately on startup
+                    if unused_pct > 10.0 and deployable_gap > self.increased_capital_threshold:
                         needs_resize = True
-                        self._info(f"{self.symbol}: First run detected - {unused_pct:.1f}% of capital unused ({uncommitted_balance:.2f} {self.market}). "
-                                   f"Resizing buy orders immediately to use available capital.")
-                    elif excess_above_expected > self.increased_capital_threshold:
-                        # Small excess above threshold - just log, let observation handle it
-                        self._info(f"{self.symbol}: First run detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds expected buffer, "
-                                   f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. "
-                                   f"Keeping existing {len(existing_buy_orders)} orders (will resize after observation period).")
+                        self._info(f"{self.symbol}: First run detected - ${deployable_gap:.2f} below intended "
+                                   f"ladder size ${intended_committed:.2f}. Resizing buy orders.")
                     else:
-                        # Excess is just normal buffer - log at debug level
-                        logging.debug(f"{self.symbol}: First run detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) is within expected buffer. "
-                                    f"Keeping existing {len(existing_buy_orders)} orders.")
-                # After first-run resize, ignore small excess capital that's just the normal buffer (~5%)
-                # Only start observation period if excess capital significantly increases (new funds added)
+                        self._info(f"{self.symbol}: First run detected - uncommitted {uncommitted_balance:.2f} {self.market} "
+                                   f"(elevation reserve ${elevation_reserve:.2f}, deployable gap ${deployable_gap:.2f}). "
+                                   f"Keeping existing {len(existing_buy_orders)} orders.")
                 elif self._last_buy_committed > 0:
-                    # This is after first run - check if excess capital increased significantly
-                    # available_balance is ALREADY reduced by price elevation (e.g., 70% of total at Tier 3)
-                    # So we only need the normal 5% order placement buffer on top of that
-                    # The price elevation reserve is separate and already excluded from available_balance
-                    expected_buffer = self.available_balance * 0.05  # 5% buffer for order placement
-                    excess_above_expected = uncommitted_balance - expected_buffer
-                    # Only start observation if excess is significantly above expected buffer (new funds)
-                    if excess_above_expected > self.increased_capital_threshold:
-                        # New excess capital detected (above expected buffer) - start or continue observation
-                        if self._increased_capital_detected_at is None:
-                            self._increased_capital_detected_at = datetime.now()
-                            unused_pct = (uncommitted_balance / self.available_balance) * 100
-                            observation_period_minutes = self.increased_capital_observation_period / 60
-                            self._info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
-                                       f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
-                        else:
-                            # Observation already started - check countdown or trigger resize
-                            elapsed_seconds = (datetime.now() - self._increased_capital_detected_at).total_seconds()
-                            if elapsed_seconds >= self.increased_capital_observation_period:
-                                needs_resize = True
-                                unused_pct = (uncommitted_balance / self.available_balance) * 100
-                                observation_period_minutes = self.increased_capital_observation_period / 60
-                                self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - resizing buy orders to use more capital.")
-                            else:
-                                remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
-                                remaining_minutes = int(remaining_seconds / 60)
-                                remaining_secs = int(remaining_seconds % 60)
-                                elapsed_minutes = int(elapsed_seconds / 60)
-                                self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
-                    else:
-                        # Excess is just the normal buffer - don't start observation period
-                        pass
-                # Record when increased capital was first detected (if not already recorded)
-                elif self._increased_capital_detected_at is None:
-                    self._increased_capital_detected_at = datetime.now()
-                    unused_pct = (uncommitted_balance / self.available_balance) * 100
-                    observation_period_minutes = self.increased_capital_observation_period / 60
-                    self._info(f"{self.symbol}: Increased capital detected - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
-                               f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
-                else:
-                    # Check if observation period has passed since increased capital was first detected
-                    elapsed_seconds = (datetime.now() - self._increased_capital_detected_at).total_seconds()
-                    elapsed_hours = elapsed_seconds / 3600.0
-                    
-                    if elapsed_seconds >= self.increased_capital_observation_period:
-                        needs_resize = True
-                        unused_pct = (uncommitted_balance / self.available_balance) * 100
-                        observation_period_minutes = self.increased_capital_observation_period / 60
-                        self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - uncommitted balance ({uncommitted_balance:.2f} {self.market}) exceeds threshold (${self.increased_capital_threshold:.2f}), "
-                                   f"committed: {existing_buy_committed:.2f} {self.market}, {unused_pct:.1f}% unused. Resizing buy orders to use more capital.")
-                    else:
-                        remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
-                        remaining_minutes = int(remaining_seconds / 60)
-                        remaining_secs = int(remaining_seconds % 60)
-                        elapsed_minutes = int(elapsed_seconds / 60)
-                        self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, {remaining_minutes}m {remaining_secs}s remaining before resize")
-            else:
-                # No excess capital - reset the detection timestamp
-                if self._increased_capital_detected_at is not None:
-                    logging.debug(f"{self.symbol}: Excess capital no longer detected, resetting observation period.")
-                    self._increased_capital_detected_at = None
-            
-            # Check if committed amount increased significantly (balance increased)
-            if old_buy_committed > 0 and existing_buy_committed < old_buy_committed * 0.7:
-                # Committed decreased (some orders filled), but check if we have much more available now
-                # Uses dollar threshold instead of percentage (default $500)
-                if uncommitted_balance > self.increased_capital_threshold:
-                    # This scenario also needs the 1-hour observation period
                     if self._increased_capital_detected_at is None:
                         self._increased_capital_detected_at = datetime.now()
                         observation_period_minutes = self.increased_capital_observation_period / 60
-                        self._info(f"{self.symbol}: Increased capital detected after buy orders filled - significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Starting {observation_period_minutes:.0f}-minute observation period.")
+                        self._info(f"{self.symbol}: Increased deployable capital - gap ${deployable_gap:.2f} above "
+                                   f"threshold (${self.increased_capital_threshold:.2f}) vs intended ${intended_committed:.2f} "
+                                   f"(committed ${existing_buy_committed:.2f}, reserve ${elevation_reserve:.2f}). "
+                                   f"Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
                     else:
                         elapsed_seconds = (datetime.now() - self._increased_capital_detected_at).total_seconds()
                         if elapsed_seconds >= self.increased_capital_observation_period:
                             needs_resize = True
                             observation_period_minutes = self.increased_capital_observation_period / 60
-                            self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - buy orders filled, but significant uncommitted balance ({uncommitted_balance:.2f} {self.market}) available. Resizing.")
+                            self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - "
+                                       f"resizing buy orders to close ${deployable_gap:.2f} gap vs intended ${intended_committed:.2f}.")
+                        else:
+                            remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
+                            remaining_minutes = int(remaining_seconds / 60)
+                            remaining_secs = int(remaining_seconds % 60)
+                            elapsed_minutes = int(elapsed_seconds / 60)
+                            self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, "
+                                       f"{remaining_minutes}m {remaining_secs}s remaining before resize "
+                                       f"(deployable gap ${deployable_gap:.2f})")
+                elif self._increased_capital_detected_at is None:
+                    self._increased_capital_detected_at = datetime.now()
+                    observation_period_minutes = self.increased_capital_observation_period / 60
+                    self._info(f"{self.symbol}: Increased deployable capital - gap ${deployable_gap:.2f}. "
+                               f"Starting {observation_period_minutes:.0f}-minute observation period before resizing.")
+                else:
+                    elapsed_seconds = (datetime.now() - self._increased_capital_detected_at).total_seconds()
+                    if elapsed_seconds >= self.increased_capital_observation_period:
+                        needs_resize = True
+                        observation_period_minutes = self.increased_capital_observation_period / 60
+                        self._info(f"{self.symbol}: Observation period ({observation_period_minutes:.0f} minutes) complete - "
+                                   f"resizing buy orders to close ${deployable_gap:.2f} gap vs intended ${intended_committed:.2f}.")
+                    else:
+                        remaining_seconds = self.increased_capital_observation_period - elapsed_seconds
+                        remaining_minutes = int(remaining_seconds / 60)
+                        remaining_secs = int(remaining_seconds % 60)
+                        elapsed_minutes = int(elapsed_seconds / 60)
+                        self._info(f"{self.symbol}: ⏳ Capital observation period: {elapsed_minutes}m elapsed, "
+                                   f"{remaining_minutes}m {remaining_secs}s remaining before resize "
+                                   f"(deployable gap ${deployable_gap:.2f})")
+            else:
+                # Committed amount is at (or above) the allocated ladder size — reserve is intentional
+                if self._increased_capital_detected_at is not None:
+                    self._info(f"{self.symbol}: Buy ladder at allocated size "
+                               f"(committed ${existing_buy_committed:.2f} vs intended ${intended_committed:.2f}) — "
+                               f"resetting observation period (idle {self.market} is elevation reserve, not new capital).")
+                    self._increased_capital_detected_at = None
+            
+            # If buys filled, committed can fall below intended — same deployable-gap check above handles it.
+            if old_buy_committed > 0 and existing_buy_committed < old_buy_committed * 0.7:
+                if has_excess_capital:
+                    logging.debug(f"{self.symbol}: Buy committed dropped after fills "
+                                f"(${old_buy_committed:.2f} → ${existing_buy_committed:.2f}); "
+                                f"deployable gap ${deployable_gap:.2f} will resize after observation.")
             
             # Check if price moved significantly - if so, try to edit orders to new levels
             price_moved = self.should_update_orders()
@@ -4242,15 +4572,28 @@ class OrderManager:
             # Adding orders incrementally - use 95% buffer for safety
             base_buy_amount = available_for_orders * 0.95
         
-        # Apply price elevation allocation adjustment
-        # When price is near recent highs, use less capital to preserve funds for better entries
-        if self.price_elevation_enabled and allocation_pct < 100:
+        # Apply allocation % to uncommitted slice being deployed now
+        if allocation_pct < 100:
             total_buy_amount = base_buy_amount * (allocation_pct / 100)
-            reserved_amount = base_buy_amount - total_buy_amount
-            self._info(f"{self.symbol}: Price Elevation: Using {allocation_pct}% of balance "
-                        f"(${total_buy_amount:.2f}), reserving ${reserved_amount:.2f} for lower prices")
         else:
             total_buy_amount = base_buy_amount
+        
+        # Never exceed intended ladder budget (allocation % + optional USDC cap)
+        intended_ladder = self._intended_buy_committed(allocation_pct)
+        remaining_ladder_budget = max(0.0, intended_ladder - existing_buy_committed)
+        if total_buy_amount > remaining_ladder_budget:
+            if remaining_ladder_budget < self.min_order_size:
+                self._info(
+                    f"{self.symbol}: Buy ladder at target — ${existing_buy_committed:.0f} committed "
+                    f"(target ${intended_ladder:.0f}), no additional orders"
+                )
+                self.log_buy_orders_list()
+                return
+            self._info(
+                f"{self.symbol}: Capping this placement to ${remaining_ladder_budget:.0f} "
+                f"(target ladder ${intended_ladder:.0f}, already ${existing_buy_committed:.0f} committed)"
+            )
+            total_buy_amount = remaining_ladder_budget
         
         # Identify which ladder levels are missing (gap-filling logic)
         # When skip_levels > 0, we only consider levels from skip_levels onwards

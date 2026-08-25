@@ -8,7 +8,19 @@ Freqtrade is the process host only: `SpotLadderStrategy` does not emit trade sig
 
 **Market:** Hyperliquid **XRP/USDC perp** (`XRP/USDC:USDC` in CCXT). Collateral is USDC; long position size is treated as XRP inventory for ladder sizing.
 
-**Buy ladder:** Limit buys placed below last price at configured `%` rungs (`buy_levels`, default 0.5–15%). Size uses weighted distribution (more on near rungs). The ladder reprices when price moves beyond `price_update_threshold` (and related time windows). Up to `balance_percentage_per_symbol` of free USDC is committed (default 90%). Optional `price_elevation` (disabled by default) can reduce allocation and skip shallow rungs when price is high in a rolling window.
+**Buy ladder:** Limit buys placed below last price at configured `%` rungs (`buy_levels`, default 0.5–15%). Size uses weighted distribution (more on near rungs). The ladder reprices when price moves beyond `price_update_threshold` (and related time windows). Up to `balance_percentage_per_symbol` of free USDC is committed (default 90%), then **price elevation** further caps how much of that slice is actually placed.
+
+**Capital protection (price_elevation, on by default):** Buy-ladder dollars scale with how expensive spot is vs a 180-day window (percentile rank). At the top tier only **20%** of the deployable slice goes on the ladder; idle USDC is reserved, not treated as “new capital.” Extra layers:
+
+- **position_aware** — if the book is mostly cash, allocation can boost toward 75%, but that boost **fades to zero near a rolling high** so a full XRP sell at an expensive price does not immediately redeploy.
+- **entry_aware** — if still holding inventory and spot is ≥15% below average entry, a floor (50–65%) can raise deployment for recovery buys.
+- **max_buy_ladder_usdc** — hard cap on committed buy-ladder USDC (default 2000). Lower of allocation % and this cap wins.
+
+Seed 180 days of history before relying on the percentile, or the first cycles stay at 100% (neutral / insufficient data):
+
+```bash
+docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/fetch_historical_prices.py --days 180
+```
 
 **Sell ladders (mean-reversion enabled):** Position splits into **Core** (~90%) and **Working** (~10%, `working_position_pct`):
 
@@ -27,6 +39,7 @@ With `mean_reversion.enabled: false`, the full position uses the Core ladder onl
 - `config-private.json.example` — template for the server
 - `strategies/SpotLadderStrategy.py`
 - `spot_ladder/` — ladder code, `config.yaml`, `state/*.example`, `state/.gitkeep`
+  (`fetch_historical_prices.py` seeds `price_high_{COIN}.json` for elevation)
 
 ## Not tracked (created on the server)
 
@@ -47,6 +60,10 @@ cp user_data/config-private.json.example user_data/config-private.json
 #    user_data/spot_ladder/state/filled_orders_XRP.json
 
 docker compose up -d
+
+# Required for price_elevation (otherwise first cycles deploy 100% until samples accumulate):
+docker compose exec -T freqtrade python /freqtrade/user_data/spot_ladder/fetch_historical_prices.py --days 180
+
 docker compose logs -f
 ```
 

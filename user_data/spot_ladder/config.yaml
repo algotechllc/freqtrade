@@ -81,6 +81,8 @@ trading:
   small_position_multiplier: 1.0
   small_position_threshold: 0.5
 
+  # Must stay above the shallowest *active* buy rung or a dip can cancel/replace
+  # instead of fill. ATH skip_levels is 0 (first rung 0.5%) — keep 4.0+ not 0.5.
   price_update_threshold: 4.0
   price_update_short_window: 1800
   price_update_time_window: 3600
@@ -104,10 +106,33 @@ trading:
   increased_capital_threshold: 50.0
   increased_capital_observation_period: 600
   sell_ladder_rebalance_threshold_pct: 5.0
+  # Max USDC on the buy ladder at once (0 = unlimited). Stacks with allocation % /
+  # entry floor — whichever is lower wins. Stops a full flatten at a high price from
+  # immediately redeploying the whole wallet.
+  max_buy_ladder_usdc: 1000.0
 
+# Scales buy-ladder $ by how cheap/expensive spot is vs the rolling window.
+# Seed history first or the first cycles stay at 100% (neutral / insufficient data):
+#   python user_data/spot_ladder/fetch_historical_prices.py --days 180
 price_elevation:
-  enabled: false
-  window_hours: 2160
+  enabled: true
+  window_hours: 4320 # 180 days
+  # Boost buy deploy when underweight tokens (mostly cash). Fades out near a rolling high
+  # so a full XRP sell at an expensive price does not jump from 20% → 75%.
+  position_aware:
+    enabled: true
+    low_token_threshold_pct: 30
+    high_token_threshold_pct: 70
+    boost_allocation_pct: 75
+    max_boost_percentile: 80
+  # Floor when spot is materially below avg entry (token-heavy + underwater). Does not
+  # apply after a full flatten (no book / no entry).
+  entry_aware:
+    enabled: true
+    min_discount_pct: 15
+    allocation_floor_pct: 50
+    extra_per_10_pct_below: 5
+    max_allocation_pct: 65
   tiers:
     - max_percentile: 20
       allocation: 100
@@ -116,21 +141,21 @@ price_elevation:
       allocation: 85
       skip_levels: 0
     - max_percentile: 60
-      allocation: 70
+      allocation: 65
       skip_levels: 1
     - max_percentile: 80
-      allocation: 55
-      skip_levels: 2
-    - max_percentile: 100
       allocation: 40
-      skip_levels: 3
+      skip_levels: 1
+    - max_percentile: 100
+      allocation: 20
+      skip_levels: 0
 
 safety:
   max_buy_orders: 10
   max_sell_orders: 15
   max_core_sell_orders: 15
   max_working_sell_orders: 6
-  # Unused by design — price_elevation tiers throttle buy allocation when price is high.
+  # Unused by design — price_elevation + max_buy_ladder_usdc throttle buy allocation.
   max_position_size: 0
   trading_enabled: true
 
