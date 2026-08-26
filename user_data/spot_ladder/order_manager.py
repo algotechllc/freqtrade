@@ -67,6 +67,9 @@ class OrderManager:
         self.balance_percentage = config['trading']['balance_percentage_per_symbol']
         self.min_order_size = config['trading']['min_order_size']
         self.price_update_threshold = config['trading']['price_update_threshold']
+        self.buy_ladder_rebuild_on_fill_pct = float(
+            config['trading'].get('buy_ladder_rebuild_on_fill_pct', 3.0)
+        )
         self.price_update_time_window = config['trading'].get('price_update_time_window', 3600)  # Default 1 hour in seconds
         self.price_update_short_window = config['trading'].get('price_update_short_window', 1800)  # Default 30 minutes for catching gradual drops
         self.price_update_quick_window = config['trading'].get('price_update_quick_window', 600)  # Default 10 minutes for catching sudden drops
@@ -165,10 +168,10 @@ class OrderManager:
         # Cheaper (lower percentile) = more aggressive (higher allocation, fewer skips).
         self.price_elevation_tiers = self.price_elevation_config.get('tiers', [
             {'max_percentile': 20, 'allocation': 100, 'skip_levels': 0},
-            {'max_percentile': 40, 'allocation': 85, 'skip_levels': 0},
+            {'max_percentile': 40, 'allocation': 85, 'skip_levels': 1},
             {'max_percentile': 60, 'allocation': 65, 'skip_levels': 1},
             {'max_percentile': 80, 'allocation': 40, 'skip_levels': 1},
-            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 0},
+            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 1},
         ])
         self._load_position_aware_config()
         self._load_entry_aware_config()
@@ -255,6 +258,9 @@ class OrderManager:
         self.balance_percentage = config['trading']['balance_percentage_per_symbol']
         self.min_order_size = config['trading']['min_order_size']
         self.price_update_threshold = config['trading']['price_update_threshold']
+        self.buy_ladder_rebuild_on_fill_pct = float(
+            config['trading'].get('buy_ladder_rebuild_on_fill_pct', 3.0)
+        )
         self.price_update_time_window = config['trading'].get('price_update_time_window', 3600)
         self.price_update_short_window = config['trading'].get('price_update_short_window', 1800)
         self.price_update_quick_window = config['trading'].get('price_update_quick_window', 600)
@@ -289,10 +295,10 @@ class OrderManager:
         self.price_elevation_window_hours = self.price_elevation_config.get('window_hours', 4320)
         self.price_elevation_tiers = self.price_elevation_config.get('tiers', [
             {'max_percentile': 20, 'allocation': 100, 'skip_levels': 0},
-            {'max_percentile': 40, 'allocation': 85, 'skip_levels': 0},
+            {'max_percentile': 40, 'allocation': 85, 'skip_levels': 1},
             {'max_percentile': 60, 'allocation': 65, 'skip_levels': 1},
             {'max_percentile': 80, 'allocation': 40, 'skip_levels': 1},
-            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 0},
+            {'max_percentile': 100, 'allocation': 20, 'skip_levels': 1},
         ])
         self._load_position_aware_config()
         self._load_entry_aware_config()
@@ -2872,6 +2878,75 @@ class OrderManager:
             return amount
         return min(amount, self.max_buy_ladder_usdc)
 
+    def _occupied_buy_level_indices(
+        self,
+        orders: List,
+        levels: List[float],
+        reference_price: float,
+        tolerance_pct: float = 0.5,
+    ) -> set:
+        """Return effective-level indices that already have a resting order near the expected price."""
+        occupied = set()
+        if reference_price <= 0 or not levels:
+            return occupied
+        for order in orders:
+            for idx, level_pct in enumerate(levels):
+                if idx in occupied:
+                    continue
+                expected = reference_price * (1 - level_pct / 100.0)
+                if expected <= 0:
+                    continue
+                if abs((order.rate - expected) / expected) * 100.0 < tolerance_pct:
+                    occupied.add(idx)
+                    break
+        return occupied
+
+    def _missing_buy_level_pcts(
+        self,
+        orders: List,
+        levels: List[float],
+        reference_price: float,
+    ) -> List[float]:
+        """Discount % of effective rungs that are not currently on the book."""
+        occupied = self._occupied_buy_level_indices(orders, levels, reference_price)
+        return [levels[i] for i in range(len(levels)) if i not in occupied]
+
+    def _should_full_rebuild_buy_ladder(
+        self,
+        existing_buy_orders: List,
+        effective_levels: List[float],
+        price_moved_significantly: bool,
+    ) -> Tuple[bool, str]:
+        """Whether to cancel remaining buy rungs and rebuild the whole ladder.
+
+        Shallow fills (0.5/1/2%) must not cannibalise -7/-10/-15% insurance.
+        Rebuild only when price has moved by price_update_threshold, or a real
+        dip has filled a rung at/deeper than buy_ladder_rebuild_on_fill_pct.
+        """
+        if price_moved_significantly:
+            return True, (
+                f"price moved ≥{self.price_update_threshold:.1f}% from placement "
+                f"(reposition entire ladder)"
+            )
+        if not existing_buy_orders or not effective_levels:
+            return False, ""
+        reference_price = (
+            self.price_when_orders_placed
+            if self.price_when_orders_placed > 0
+            else self.current_price
+        )
+        missing_pcts = self._missing_buy_level_pcts(
+            existing_buy_orders, effective_levels, reference_price
+        )
+        rebuild_at = self.buy_ladder_rebuild_on_fill_pct
+        deep_missing = [p for p in missing_pcts if p >= rebuild_at]
+        if deep_missing:
+            return True, (
+                f"{min(deep_missing):.1f}%+ rung filled "
+                f"(rebuild threshold {rebuild_at:.1f}%; missing {deep_missing})"
+            )
+        return False, ""
+
     def _gross_buy_deployable(self) -> float:
         """Quote available for buy-ladder deployment after fee buffer (before allocation % or cap)."""
         if self.available_balance <= 0:
@@ -4513,8 +4588,9 @@ class OrderManager:
         # 1. Price has moved significantly (>= threshold) - ladder needs repositioning anyway
         # 2. Multiple orders are missing (>1) - allows natural accumulation before rebalancing
         # This prevents unnecessary order placement after single fills and reduces API calls
+        price_moved_significantly = False
+        should_skip_single_gap = False
         if orders_to_place > 0:
-            price_moved_significantly = False
             if self.price_when_orders_placed > 0:
                 price_change_pct = abs((self.current_price - self.price_when_orders_placed) / self.price_when_orders_placed) * 100
                 if price_change_pct >= self.price_update_threshold:
@@ -4523,25 +4599,38 @@ class OrderManager:
             # Skip placing single gap-filling orders unless price moved or multiple orders missing
             # We'll check if it's a shallow level later (after missing_level_indices is calculated)
             should_skip_single_gap = orders_to_place == 1 and not price_moved_significantly
-            
-            # If we're missing a significant number of orders (>20%), cancel all and recreate with full balance
-            # This ensures proper sizing - placing missing orders with partial balance makes them undersized
-        if orders_to_place > 0 and needed_orders > 0:
-            missing_pct = (orders_to_place / needed_orders) * 100
-            if missing_pct > 20.0:  # More than 20% missing
-                self._info(f"{self.symbol}: Missing {orders_to_place}/{needed_orders} orders ({missing_pct:.1f}%) - cancelling all {len(existing_buy_orders)} orders to recreate with full balance for proper sizing")
+        
+        # Full rebuild only on a 4% price move or a 3%+ rung fill. Two shallow fills
+        # (22% missing on a 9-rung ladder) used to cancel -7/-10/-15% insurance and
+        # re-arm the 0.5% bid — that is the grind-down vacuum.
+        if orders_to_place > 0 and needed_orders > 0 and existing_buy_orders:
+            should_rebuild, rebuild_reason = self._should_full_rebuild_buy_ladder(
+                existing_buy_orders, effective_levels, price_moved_significantly
+            )
+            if should_rebuild:
+                self._info(
+                    f"{self.symbol}: Missing {orders_to_place}/{needed_orders} buy orders — "
+                    f"full rebuild ({rebuild_reason})"
+                )
                 for order in existing_buy_orders:
                     try:
                         self.api.cancel_order(order.order_id, order_type="buy")
                         logging.debug(f"{self.symbol}: Cancelled buy order {order.order_id} for full rebuild")
                     except Exception as e:
                         logging.warning(f"{self.symbol}: Failed to cancel order {order.order_id}: {e}")
-                if existing_buy_orders:
-                    time.sleep(0.5)
+                time.sleep(0.5)
                 existing_buy_orders = []
                 existing_buy_committed = 0
                 uncommitted_balance = self.available_balance
                 orders_to_place = needed_orders
+                should_skip_single_gap = False
+            else:
+                self._info(
+                    f"{self.symbol}: Missing {orders_to_place}/{needed_orders} buy orders — "
+                    f"gap-filling only (keeping {len(existing_buy_orders)} deeper rungs parked; "
+                    f"rebuild needs {self.price_update_threshold:.1f}% price move or "
+                    f"{self.buy_ladder_rebuild_on_fill_pct:.1f}%+ fill)"
+                )
         
         self._info(f"{self.symbol}: Placing buy ladder - available: {self.available_balance:.2f} {self.market}, "
                     f"committed: {existing_buy_committed:.2f} {self.market}, uncommitted: {uncommitted_balance:.2f} {self.market}, "
@@ -4641,28 +4730,26 @@ class OrderManager:
             level_indices_to_fill = list(range(needed_orders))
             self._info(f"{self.symbol}: Placing all {needed_orders} orders from scratch at levels: {[effective_levels[i] for i in level_indices_to_fill]}%")
         else:
-            # Map existing orders to their level indices (within effective_levels)
-            # For deep levels (15%+), also check if price moved up - if so, keep existing orders at old prices
-            
-            existing_level_indices = set()
-            for order in existing_buy_orders:
-                for relative_idx, level_pct in enumerate(effective_levels):
-                    expected_price = self.current_price * (1 - level_pct / 100)
-                    price_diff_pct = abs((order.rate - expected_price) / order.rate) * 100
-                    
-                    # For deep levels (15%+) when price moved up, check if order is at a reasonable deep level price
-                    # (within 20% of expected, to account for price movement)
-                    if level_pct >= 15.0 and price_moved_up:
-                        # Deep level - check if order is at a reasonable discount (could be old price)
+            # Map parked orders to the levels they were placed at. Use placement
+            # price unless the 4% threshold fired — otherwise a 1-2% drift makes
+            # -7/-10/-15% insurance look "missing" and we would duplicate them.
+            reference_price = validation_price if validation_price > 0 else self.current_price
+            existing_level_indices = self._occupied_buy_level_indices(
+                existing_buy_orders, effective_levels, reference_price
+            )
+            if price_moved_up:
+                for order in existing_buy_orders:
+                    for relative_idx, level_pct in enumerate(effective_levels):
+                        if relative_idx in existing_level_indices or level_pct < 15.0:
+                            continue
                         discount_from_current = ((self.current_price - order.rate) / self.current_price) * 100
-                        if discount_from_current >= level_pct * 0.8:  # At least 80% of expected discount
+                        if discount_from_current >= level_pct * 0.8:
                             existing_level_indices.add(relative_idx)
-                            logging.debug(f"{self.symbol}: Deep level {level_pct}% order exists at old price {order.rate:.4f} (discount: {discount_from_current:.1f}%), keeping it")
+                            logging.debug(
+                                f"{self.symbol}: Deep level {level_pct}% order exists at old price "
+                                f"{order.rate:.4f} (discount: {discount_from_current:.1f}%), keeping it"
+                            )
                             break
-                    
-                    if price_diff_pct < 0.5:  # Matches this level at current price
-                        existing_level_indices.add(relative_idx)
-                        break
             
             # Find missing level indices (gaps to fill) - relative to effective_levels
             all_level_indices = set(range(len(effective_levels)))

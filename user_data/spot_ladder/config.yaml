@@ -82,8 +82,14 @@ trading:
   small_position_threshold: 0.5
 
   # Must stay above the shallowest *active* buy rung or a dip can cancel/replace
-  # instead of fill. ATH skip_levels is 0 (first rung 0.5%) — keep 4.0+ not 0.5.
+  # instead of fill. Typical active first rung is 1.0% (0.5% is skipped except
+  # ≤20th percentile) — keep 4.0+ not 0.5.
   price_update_threshold: 4.0
+  # Full buy-ladder rebuild (cancel remaining rungs, including -7/-10/-15% insurance) only when:
+  #   1) price has moved by price_update_threshold, or
+  #   2) a rung at/deeper than this % has filled (a real dip, not 0.5/1/2% noise).
+  # Shallower fills gap-replace only — they must not cannibalise deep rungs to re-arm the top.
+  buy_ladder_rebuild_on_fill_pct: 3.0
   price_update_short_window: 1800
   price_update_time_window: 3600
   price_update_quick_threshold: 5.0
@@ -133,22 +139,25 @@ price_elevation:
     allocation_floor_pct: 50
     extra_per_10_pct_below: 5
     max_allocation_pct: 65
+  # skip_levels = drop first N entries from buy_levels (0.5, 1.0, 2.0, …).
+  # 0.5% is skipped except ≤20th percentile: it sits inside a typical hourly
+  # range (~0.6%), so it fills as noise. 1% and 2% stay.
   tiers:
     - max_percentile: 20
       allocation: 100
-      skip_levels: 0
+      skip_levels: 0 # Full ladder including 0.5% — only tier where noise-rung is worth arming
     - max_percentile: 40
       allocation: 85
-      skip_levels: 0
+      skip_levels: 1 # Skip 0.5% (typical hourly range); keep 1% and 2%
     - max_percentile: 60
       allocation: 65
-      skip_levels: 1
+      skip_levels: 1 # Skip 0.5% — first bids at 1.0% below spot
     - max_percentile: 80
       allocation: 40
-      skip_levels: 1
+      skip_levels: 1 # Skip 0.5% only — keep 1% and 2% as the mean-reversion cadence
     - max_percentile: 100
       allocation: 20
-      skip_levels: 0
+      skip_levels: 1 # Skip 0.5% even when expensive — allocation % already caps $; 1%/2% still cycle
 
 safety:
   max_buy_orders: 10
