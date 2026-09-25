@@ -71,6 +71,10 @@ trading:
       - 2.5
       - 2.75
     cancel_working_threshold_pct: 5.0
+    # Filled rungs are left empty — remaining Working sells are not cancelled, and the
+    # filled slot is not replaced. A move of this % from placement still cancels and
+    # recreates the whole ladder. 3.0% is above the highest working_sell_level (2.75%),
+    # so a grind up can fill several (or all) rungs before recreate.
     working_price_update_threshold: 3.0
 
   order_size_distribution: weighted

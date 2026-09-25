@@ -6082,42 +6082,73 @@ class OrderManager:
         if working_orders:
             self._save_working_order_ids()
 
-    def _working_ladder_needs_level_recalc(self, working_orders: List) -> bool:
-        """True when existing Working orders don't match the configured levels
-        relative to the price at which they were PLACED.
+    def _infer_working_placement_price(self, working_orders: List) -> float:
+        """Infer the price the current Working book was placed from.
 
-        IMPORTANT: This anchors to the placement price (_last_working_price), NOT
-        the current price. Price-driven repositioning is governed separately by
-        working_price_update_threshold. Anchoring this check to current_price would
-        force a full cancel/rebuild on every small tick (e.g. on each buy) and
-        defeat that threshold — which is exactly the over-recreation bug this fixes.
-        It still catches a genuinely malformed ladder (orders at the wrong levels).
+        After shallow fills the lowest remaining order is no longer the 1.5% rung,
+        so assuming it is would shift the whole ladder and false-trigger a rebuild.
+        Try each configured level as the identity of the lowest order and pick the
+        candidate that matches the most remaining orders.
+        """
+        if not working_orders or not self.working_sell_levels:
+            return 0.0
+        lowest_rate = min(order.rate for order in working_orders)
+        tolerance_pct = 0.15
+        best_price = lowest_rate / (1 + self.working_sell_levels[0] / 100.0)
+        best_matches = -1
+        best_level_pct = self.working_sell_levels[0]
+        for level_pct in self.working_sell_levels:
+            candidate = lowest_rate / (1 + level_pct / 100.0)
+            if candidate <= 0:
+                continue
+            expected = [candidate * (1 + p / 100.0) for p in self.working_sell_levels]
+            matched = set()
+            matches = 0
+            for order in working_orders:
+                for idx, exp in enumerate(expected):
+                    if idx in matched or exp <= 0:
+                        continue
+                    if abs(order.rate - exp) / exp * 100.0 < tolerance_pct:
+                        matched.add(idx)
+                        matches += 1
+                        break
+            # Equal match counts: prefer treating the lowest remaining order as a
+            # deeper rung (shallow fills left holes) rather than shifting the book.
+            if matches > best_matches or (matches == best_matches and level_pct > best_level_pct):
+                best_matches = matches
+                best_level_pct = level_pct
+                best_price = candidate
+        return best_price
+
+    def _working_ladder_needs_level_recalc(self, working_orders: List) -> bool:
+        """True when remaining Working orders don't sit on the placement ladder.
+
+        Missing rungs (fills) are OK — those slots stay empty until
+        working_price_update_threshold rebuilds. Wrong prices are not.
+
+        Anchors to placement price (_last_working_price), not current_price.
+        Price-driven repositioning is governed separately by the 3% threshold.
         """
         if not working_orders or not self.working_sell_levels:
             return False
 
         anchor_price = getattr(self, '_last_working_price', 0.0)
         if anchor_price <= 0:
-            # No recorded placement price (e.g. after restart): infer it from the
-            # lowest rung so we still validate relative spacing without
-            # false-firing on normal price drift.
-            lowest_rate = min(order.rate for order in working_orders)
-            anchor_price = lowest_rate / (1 + self.working_sell_levels[0] / 100.0)
+            anchor_price = self._infer_working_placement_price(working_orders)
         if anchor_price <= 0:
             return False
 
         tolerance_pct = 0.15
-        levels_to_check = self.working_sell_levels[:len(working_orders)]
         expected_rates = [
             anchor_price * (1 + level_pct / 100.0)
-            for level_pct in levels_to_check
+            for level_pct in self.working_sell_levels
         ]
         matched = set()
-        for order in sorted(working_orders, key=lambda o: o.rate):
+        for order in working_orders:
             best_idx = None
             best_diff = float('inf')
             for idx, expected_rate in enumerate(expected_rates):
-                if idx in matched:
+                if idx in matched or expected_rate <= 0:
                     continue
                 diff_pct = abs(order.rate - expected_rate) / expected_rate * 100
                 if diff_pct < best_diff:
@@ -6233,16 +6264,12 @@ class OrderManager:
         # The lowest working order should be at the first working_sell_level above the price when placed
         if old_price == 0.0:
             if working_orders and self.working_sell_levels:
-                # Find the lowest priced working order
-                lowest_order = min(working_orders, key=lambda o: o.rate)
-                # Infer the price when orders were placed: lowest_order.rate / (1 + first_level/100)
-                first_level = self.working_sell_levels[0]
-                inferred_price = lowest_order.rate / (1 + first_level / 100.0)
+                inferred_price = self._infer_working_placement_price(working_orders)
                 old_price = inferred_price
-                # Save inferred price so it persists for future checks
                 self._last_working_price = inferred_price
+                lowest_order = min(working_orders, key=lambda o: o.rate)
                 self._info(f"{self.symbol}: Inferred last working price from orders: ${inferred_price:.4f} "
-                           f"(lowest order at ${lowest_order.rate:.4f}, first level {first_level}%)")
+                           f"(lowest remaining ${lowest_order.rate:.4f})")
             else:
                 # No orders to infer from, use current price (first run)
                 old_price = self.current_price
@@ -6271,24 +6298,21 @@ class OrderManager:
         price_change_pct = abs(self.current_price - old_price) / old_price * 100 if old_price > 0 else 0
         price_moved = price_change_pct > working_price_threshold
 
-        needs_recalc = bool(working_orders) and (
-            price_moved or level_drift or fills_occurred or len(working_orders) != needed_orders
-        )
+        # Recreate only on a 3% (threshold) price move, or a ladder that no longer
+        # matches placement prices. Filled rungs stay empty — do not cancel the
+        # rest or replace the slot. An empty book still re-arms below.
+        needs_recalc = bool(working_orders) and (price_moved or level_drift)
 
         if needs_recalc:
             if price_moved:
                 reason = f"price moved {price_change_pct:.1f}% ({old_price:.4f} -> {self.current_price:.4f})"
-            elif level_drift:
+            else:
                 lowest = min(o.rate for o in working_orders)
-                expected = self.current_price * (1 + self.working_sell_levels[0] / 100.0)
+                expected = old_price * (1 + self.working_sell_levels[0] / 100.0)
                 reason = (
                     f"orders drifted from configured levels "
-                    f"(lowest ${lowest:.4f} vs expected ${expected:.4f} at +{self.working_sell_levels[0]}%)"
+                    f"(lowest ${lowest:.4f} vs expected ${expected:.4f} at +{self.working_sell_levels[0]}% of placement)"
                 )
-            elif fills_occurred:
-                reason = "Working order(s) filled"
-            else:
-                reason = f"order count mismatch ({len(working_orders)} vs {needed_orders} needed)"
             self._info(f"{self.symbol}: Recalculating Working ladder - {reason}")
             self._cancel_working_orders(working_orders)
             time.sleep(0.5)
@@ -6317,6 +6341,12 @@ class OrderManager:
                 return
 
         if len(working_orders) > 0:
+            if fills_occurred or len(working_orders) < needed_orders:
+                self._info(
+                    f"{self.symbol}: Working ladder holding {len(working_orders)}/{needed_orders} "
+                    f"rungs after fill(s) — leaving slots empty until "
+                    f"{working_price_threshold:.1f}% price move"
+                )
             self._last_working_coins = working_coins
             return
 
