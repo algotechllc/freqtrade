@@ -89,11 +89,12 @@ trading:
   # instead of fill. Typical active first rung is 1.0% (0.5% is skipped except
   # ≤20th percentile) — keep 4.0+ not 0.5.
   price_update_threshold: 4.0
-  # Full buy-ladder rebuild (cancel remaining rungs, including -7/-10/-15% insurance) only when:
-  #   1) price has moved by price_update_threshold, or
-  #   2) a rung at/deeper than this % has filled (a real dip, not 0.5/1/2% noise).
-  # Shallower fills gap-replace only — they must not cannibalise deep rungs to re-arm the top.
-  buy_ladder_rebuild_on_fill_pct: 3.0
+  # Full buy-ladder rebuild (cancel remaining rungs, including -7/-10/-15% insurance)
+  # only when price has moved by price_update_threshold. A 3%+ fill must NOT rebuild:
+  # that is tighter than 4%, so a 3.3% dip re-armed the whole ladder at the low
+  # while the stay-put rule said "not yet". Filled shallow slots gap-replace;
+  # deep rungs stay parked until the 4% move.
+  buy_ladder_rebuild_on_fill_pct: 5.0
   price_update_short_window: 1800
   price_update_time_window: 3600
   price_update_quick_threshold: 5.0

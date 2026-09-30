@@ -2919,31 +2919,16 @@ class OrderManager:
     ) -> Tuple[bool, str]:
         """Whether to cancel remaining buy rungs and rebuild the whole ladder.
 
-        Shallow fills (0.5/1/2%) must not cannibalise -7/-10/-15% insurance.
-        Rebuild only when price has moved by price_update_threshold, or a real
-        dip has filled a rung at/deeper than buy_ladder_rebuild_on_fill_pct.
+        Only a price_update_threshold move repositions the book. Fill-based
+        rebuild used to fire at buy_ladder_rebuild_on_fill_pct (3%), which is
+        *tighter* than the 4% stay-put rule — a 3.3% dip filled the 3% rung,
+        cancelled -7/-10/-15% insurance, and re-armed the ladder at the low.
+        Shallow fills gap-replace; deep rungs stay until the 4% move.
         """
         if price_moved_significantly:
             return True, (
                 f"price moved ≥{self.price_update_threshold:.1f}% from placement "
                 f"(reposition entire ladder)"
-            )
-        if not existing_buy_orders or not effective_levels:
-            return False, ""
-        reference_price = (
-            self.price_when_orders_placed
-            if self.price_when_orders_placed > 0
-            else self.current_price
-        )
-        missing_pcts = self._missing_buy_level_pcts(
-            existing_buy_orders, effective_levels, reference_price
-        )
-        rebuild_at = self.buy_ladder_rebuild_on_fill_pct
-        deep_missing = [p for p in missing_pcts if p >= rebuild_at]
-        if deep_missing:
-            return True, (
-                f"{min(deep_missing):.1f}%+ rung filled "
-                f"(rebuild threshold {rebuild_at:.1f}%; missing {deep_missing})"
             )
         return False, ""
 
@@ -4600,9 +4585,9 @@ class OrderManager:
             # We'll check if it's a shallow level later (after missing_level_indices is calculated)
             should_skip_single_gap = orders_to_place == 1 and not price_moved_significantly
         
-        # Full rebuild only on a 4% price move or a 3%+ rung fill. Two shallow fills
-        # (22% missing on a 9-rung ladder) used to cancel -7/-10/-15% insurance and
-        # re-arm the 0.5% bid — that is the grind-down vacuum.
+        # Full rebuild only on a 4% price move. A 3% fill used to cancel remaining
+        # insurance and re-arm the whole ladder at the low while the 4% stay-put
+        # rule still said "not yet". Shallow fills gap-replace; deep rungs stay.
         if orders_to_place > 0 and needed_orders > 0 and existing_buy_orders:
             should_rebuild, rebuild_reason = self._should_full_rebuild_buy_ladder(
                 existing_buy_orders, effective_levels, price_moved_significantly
@@ -4628,8 +4613,7 @@ class OrderManager:
                 self._info(
                     f"{self.symbol}: Missing {orders_to_place}/{needed_orders} buy orders — "
                     f"gap-filling only (keeping {len(existing_buy_orders)} deeper rungs parked; "
-                    f"rebuild needs {self.price_update_threshold:.1f}% price move or "
-                    f"{self.buy_ladder_rebuild_on_fill_pct:.1f}%+ fill)"
+                    f"full rebuild needs {self.price_update_threshold:.1f}% price move)"
                 )
         
         self._info(f"{self.symbol}: Placing buy ladder - available: {self.available_balance:.2f} {self.market}, "
@@ -6066,10 +6050,6 @@ class OrderManager:
         # This ensures we track the current state for future comparisons
         self._last_avg_entry = avg_entry
         self._last_core_coins = core_coins
-        
-        # Track price when orders were placed (for slow price drop detection)
-        if self.current_price > 0:
-            self.price_when_orders_placed = self.current_price
     
     def _cancel_working_orders(self, working_orders: List) -> None:
         """Cancel open Working sell orders and remove them from tracking."""
@@ -6606,10 +6586,6 @@ class OrderManager:
             )
         
         self._info(f"{self.symbol}: Resized {len(existing_prices)} sell orders - preserved prices, updated amounts to use full balance")
-        
-        # Track price when orders were resized (for slow price drop detection)
-        if self.current_price > 0:
-            self.price_when_orders_placed = self.current_price
     
     def _resize_and_update_sell_orders(self, existing_orders: List[Order], total_coins: float, avg_entry: float):
         """Resize sell orders AND update prices based on new average entry
@@ -6711,10 +6687,6 @@ class OrderManager:
             )
         
         self._info(f"{self.symbol}: Resized and updated {len(existing_orders)} sell orders - new prices based on avg_entry {avg_entry:.4f}, updated amounts to use full balance")
-        
-        # Track price when orders were resized and updated (for slow price drop detection)
-        if self.current_price > 0:
-            self.price_when_orders_placed = self.current_price
     
     def _update_sell_orders(self, existing_orders: List[Order], avg_entry: float):
         """Update existing sell orders to match new average entry
@@ -6886,10 +6858,6 @@ class OrderManager:
         if orders_to_cancel:
             time.sleep(0.5)  # Brief pause before placing new orders
             self.place_sell_ladder()
-        
-        # Track price when orders were updated (for slow price drop detection)
-        if self.current_price > 0:
-            self.price_when_orders_placed = self.current_price
     
     def process(self):
         """Main processing loop for this symbol"""
