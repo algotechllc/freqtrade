@@ -1150,92 +1150,42 @@ class OrderManager:
         return (net_profit, total_cost_basis)
     
     def _calculate_lifo_profit_for_pending_sell(self, sell_amount: float, sell_rate: float) -> tuple:
-        """Calculate projected profit for a pending sell order using LIFO matching
-        
-        Uses ALL non-consumed buy orders (not balance-trimmed) for LIFO matching.
-        This avoids double-counting: consumed_amount already tracks which buys were
-        sold via LIFO, so we must not also trim newest buys from the set.
-        
-        Args:
-            sell_amount: Amount of coins to sell
-            sell_rate: Price per coin for the sell
-            
+        """Projected profit for one pending sell against the coins actually held.
+
+        Walks the same balance-trimmed lots as average entry, newest first.
+        Unconsumed rows newer than the wallet are excess (already treated as
+        sold) and are not part of this cost.
+
         Returns:
             Tuple of (net_profit, net_profit_pct, cost_basis, total_investment)
             Returns (0, 0, 0, 0) if unable to calculate
         """
-        stored_orders = self._load_filled_orders()
-        if not stored_orders:
+        buy_queue = self._get_active_lifo_buy_queue()
+        if not buy_queue:
             return (0.0, 0.0, 0.0, 0.0)
-        
-        # Filter to active (non-consumed) orders
-        active_orders = []
-        for order in stored_orders:
-            if order.get('fully_consumed', False):
-                continue
-            original_amount = float(order.get('amount', 0))
-            consumed_amount = float(order.get('consumed_amount', 0))
-            remaining = original_amount - consumed_amount
-            if remaining > 0.0001:
-                order_copy = order.copy()
-                order_copy['_remaining_amount'] = remaining
-                active_orders.append(order_copy)
-        
-        if not active_orders:
-            return (0.0, 0.0, 0.0, 0.0)
-        
-        # Sort by timestamp newest first for LIFO (newest coins sold first)
-        active_orders = sorted(active_orders, key=lambda x: x.get('fill_timestamp', ''), reverse=True)
-        
-        amount_to_match = sell_amount
-        total_cost_basis = 0.0
-        
-        for buy_order in active_orders:
-            if amount_to_match <= 0:
-                break
-            
-            remaining = float(buy_order.get('_remaining_amount', 0))
-            if remaining <= 0:
-                continue
-            
-            buy_rate = float(buy_order.get('rate', 0))
-            consume_amount = min(remaining, amount_to_match)
-            cost_basis = consume_amount * buy_rate
-            total_cost_basis += cost_basis
-            amount_to_match -= consume_amount
-        
-        # Remainder only if we ran out of buy orders (e.g. sell amount > total tracked buys).
-        # Use sell_rate so that portion is break-even in display.
-        if amount_to_match > 0.0001:
-            total_cost_basis += amount_to_match * sell_rate
-        
-        # Calculate profit
-        sell_proceeds = sell_amount * sell_rate
-        buy_fee = total_cost_basis * self.buy_fee
-        sell_fee = sell_proceeds * self.sell_fee
-        net_profit = sell_proceeds - total_cost_basis - buy_fee - sell_fee
-        
-        # Calculate profit percentage relative to total investment (cost basis + buy fee)
-        total_investment = total_cost_basis + buy_fee
-        net_profit_pct = (net_profit / total_investment * 100) if total_investment > 0 else 0.0
-        
-        return (net_profit, net_profit_pct, total_cost_basis, total_investment)
+        return self._lifo_match_from_queue(buy_queue, sell_amount, sell_rate)
     
     def _get_active_lifo_buy_queue(self) -> List[Dict]:
-        """Mutable LIFO buy queue (newest first) from unconsumed stored buy orders."""
-        stored_orders = self._load_filled_orders()
+        """Mutable LIFO buy queue (newest first) of the lots that make up the position.
+
+        Same coins as average entry. When the ledger is larger than the wallet,
+        lots that are not in the holdings set are left out: a pending sell must
+        not be priced against coins we do not hold. Synthetic shortfall rows are
+        left out too; they have no real fill and would otherwise sort as the
+        newest lot.
+        """
+        stored_orders = self._get_stored_filled_orders(verbose=False)
         if not stored_orders:
             return []
         active_orders = []
         for order in stored_orders:
-            if order.get('fully_consumed', False):
+            if order.get('synthetic'):
                 continue
-            original_amount = float(order.get('amount', 0))
-            consumed_amount = float(order.get('consumed_amount', 0))
-            remaining = original_amount - consumed_amount
-            if remaining > 0.0001:
+            remaining = float(order.get('_remaining_amount', order.get('amount', 0)) or 0)
+            rate = float(order.get('rate', 0) or 0)
+            if remaining > 0.0001 and rate > 0:
                 active_orders.append({
-                    'rate': float(order.get('rate', 0)),
+                    'rate': rate,
                     'remaining': remaining,
                     'fill_timestamp': order.get('fill_timestamp', ''),
                 })
@@ -1266,7 +1216,13 @@ class OrderManager:
         return (net_profit, net_profit_pct, total_cost_basis, total_investment)
 
     def _sequential_working_lifo_profits(self, working_orders: List[Order]) -> Dict[str, Tuple[float, float, float]]:
-        """Project Working ladder profit assuming lowest sell fills first (LIFO stack walk)."""
+        """Project Working ladder profit assuming lowest sell fills first (LIFO stack walk).
+
+        The queue is the balance-trimmed holdings (same lots as average entry), not
+        every unconsumed row in the file. Lots that are not in the wallet would
+        otherwise be sold first and keep the working rungs on a cost the position
+        does not actually hold.
+        """
         if not working_orders:
             return {}
         buy_queue = self._get_active_lifo_buy_queue()
@@ -2189,7 +2145,7 @@ class OrderManager:
             except Exception as e:
                 logging.error(f"{self.symbol}: Failed to remove duplicates: {e}")
     
-    def _get_stored_filled_orders(self) -> List[Dict]:
+    def _get_stored_filled_orders(self, verbose: bool = True) -> List[Dict]:
         """Get stored filled buy orders from JSON
         
         CRITICAL: If an order is in the JSON, we can trust it - it was only saved after
@@ -2211,6 +2167,10 @@ class OrderManager:
         """
         stored_orders = self._load_filled_orders()
         current_coin_amount = self.coin_balance
+
+        def _log(msg: str) -> None:
+            if verbose:
+                self._info(msg)
         
         if not stored_orders or current_coin_amount == 0:
             return []
@@ -2244,7 +2204,7 @@ class OrderManager:
         balance_diff_pct = abs(total_in_orders - current_coin_amount) / current_coin_amount * 100 if current_coin_amount > 0 else 0
         if current_coin_amount > 0 and balance_diff_pct < 2.0:  # Only if within 2% (very close match)
             # All orders match balance closely - use all of them
-            self._info(f"{self.symbol}: Total matches balance within 2% ({balance_diff_pct:.2f}% diff) - using all {len(active_orders)} orders")
+            _log(f"{self.symbol}: Total matches balance within 2% ({balance_diff_pct:.2f}% diff) - using all {len(active_orders)} orders")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=False)
             return active_orders
         
@@ -2253,7 +2213,7 @@ class OrderManager:
         
         if untracked_amount > 0:
             # More balance than orders - some coins not tracked, use all orders
-            self._info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) > total orders ({total_in_orders:.8f}) by {untracked_amount:.8f} - using all {len(active_orders)} orders (some coins not tracked in JSON)")
+            _log(f"{self.symbol}: Balance ({current_coin_amount:.8f}) > total orders ({total_in_orders:.8f}) by {untracked_amount:.8f} - using all {len(active_orders)} orders (some coins not tracked in JSON)")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=False)
             return active_orders
         
@@ -2261,7 +2221,7 @@ class OrderManager:
         # The excess is from tracking gaps in old orders (consumed_amount already handles
         # LIFO consumption). Always keep NEWEST orders and trim the oldest excess.
         if total_in_orders > current_coin_amount:
-            self._info(f"{self.symbol}: Balance ({current_coin_amount:.8f}) < total orders ({total_in_orders:.8f}) "
+            _log(f"{self.symbol}: Balance ({current_coin_amount:.8f}) < total orders ({total_in_orders:.8f}) "
                         f"by {total_in_orders - current_coin_amount:.8f} ({balance_diff_pct:.1f}% excess) - "
                         f"keeping newest orders (consumed_amount already tracks LIFO)")
             active_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=True)  # NEWEST first
@@ -2333,7 +2293,7 @@ class OrderManager:
                 }
                 orders_to_use.append(synthetic_order)
                 accumulated_amount += missing
-                self._info(
+                _log(
                     f"{self.symbol}: Filled shortfall of {missing:.8f} coins ({missing_pct:.2f}%) using average price ${avg_price:.4f} "
                     f"(from {len(orders_to_use)-1} tracked orders). Total now: {accumulated_amount:.8f} coins."
                 )
@@ -3330,9 +3290,9 @@ class OrderManager:
         of coins from position 'start_offset' to 'start_offset + sell_amount'.
         Note: Function name kept as _calculate_fifo_cost_basis_marginal for compatibility,
         but now uses LIFO logic (newest first).
-        
-        Uses ALL non-consumed buy orders (not balance-trimmed) to avoid
-        double-counting with consumed_amount tracking.
+
+        Uses the balance-trimmed holdings (same lots as average entry). Lots that
+        are not in the wallet are not part of the slice.
         
         Args:
             start_offset: Coins already consumed before this order
@@ -3341,23 +3301,16 @@ class OrderManager:
         Returns:
             Weighted average cost per coin for this specific slice
         """
-        raw_orders = self._load_filled_orders()
         stored_orders = []
-        for order in raw_orders:
-            if order.get('fully_consumed', False):
-                continue
-            original_amount = float(order.get('amount', 0))
-            consumed_amount = float(order.get('consumed_amount', 0))
-            remaining = original_amount - consumed_amount
-            if remaining > 0.0001:
-                order_copy = order.copy()
-                order_copy['_remaining_amount'] = remaining
-                stored_orders.append(order_copy)
+        for order in self._get_active_lifo_buy_queue():
+            order_copy = {
+                '_remaining_amount': order['remaining'],
+                'rate': order['rate'],
+                'fill_timestamp': order.get('fill_timestamp', ''),
+            }
+            stored_orders.append(order_copy)
         if not stored_orders:
             return self.average_entry_price  # Fallback to overall average
-        
-        # Sort by timestamp (newest first) for LIFO
-        stored_orders.sort(key=lambda x: x.get('fill_timestamp', ''), reverse=True)
         
         # First, skip past the already-consumed offset
         offset_remaining = start_offset
